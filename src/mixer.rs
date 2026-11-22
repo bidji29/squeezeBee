@@ -4,9 +4,9 @@
 //! After each bit, every weight moves by the error of the mixed prediction times what its model said: a model
 //! that pushed the right way counts for more next time, one that pushed the wrong way for less.
 //!
-//! What a model is worth depends on where the coding stands, so there are several sets of weights, each chosen
-//! by a small context of its own (see `choose`). Each set makes its own mixed prediction and learns from its own
-//! error; the mixer's answer is their average.
+//! What a model is worth depends on where the coding stands, so there are many sets of weights, and the one used
+//! for a bit is chosen by the bit's place in its byte and by the previous whole byte together (see `choose`).
+//! The mixer sees every bit in `update`, so it keeps the previous byte itself.
 //!
 //! It works for any number of inputs: every weight starts at 1 / inputs, the plain average.
 
@@ -16,10 +16,10 @@ use alloc::vec::Vec;
 use crate::context::Context;
 
 /// How many sets of weights are chosen at each bit, each by its own context.
-const SETS: usize = 3;
+const SETS: usize = 1;
 
-/// How many contexts each chooser tells apart.
-const SIZES: [usize; SETS] = [256, 256 * 8, 256 * 8];
+/// How many contexts each chooser tells apart: the bit's place (8) times the previous byte (256).
+const SIZES: [usize; SETS] = [8 * 256];
 
 /// A weight of 1 is 2^16.
 const ONE: i32 = 1 << 16;
@@ -38,6 +38,10 @@ pub struct Mixer {
     /// Where the weights chosen for this bit start, for each set, and what each set predicted (stretched).
     chosen: [usize; SETS],
     said: [i32; SETS],
+    /// The previous whole byte, the bits of the current byte seen so far, and how many they are (0 to 7).
+    previous: usize,
+    current: usize,
+    place: usize,
 }
 
 impl Mixer {
@@ -56,21 +60,22 @@ impl Mixer {
             seen: vec![0; inputs],
             chosen: [0; SETS],
             said: [0; SETS],
+            previous: 0,
+            current: 0,
+            place: 0,
         }
     }
 
     /// The context each set of weights is chosen by.
-    fn choose(cx: &Context) -> [usize; SETS] {
-        let last = (cx.last4 & 0xFF) as usize;
-        let before = ((cx.last4 >> 8) & 0xFF) as usize;
-        [cx.partial as usize, (last << 3) | cx.bit as usize, (before << 3) | cx.bit as usize]
+    fn choose(&self) -> [usize; SETS] {
+        [(self.previous << 3) | self.place]
     }
 
     /// One stretched prediction from the models' stretched predictions.
-    pub fn mix(&mut self, cx: &Context, inputs: &[i32]) -> i32 {
+    pub fn mix(&mut self, _cx: &Context, inputs: &[i32]) -> i32 {
         let n = self.inputs;
         self.seen.copy_from_slice(&inputs[..n]);
-        let contexts = Self::choose(cx);
+        let contexts = self.choose();
         let mut sum = 0;
         for set in 0..SETS {
             let at = self.bases[set] + contexts[set] * n;
@@ -95,6 +100,13 @@ impl Mixer {
             for (w, x) in self.weights[at..at + n].iter_mut().zip(self.seen.iter()) {
                 *w += (*x * error) >> RATE;
             }
+        }
+        self.current = (self.current << 1) | bit as usize;
+        self.place += 1;
+        if self.place == 8 {
+            self.previous = self.current & 0xFF;
+            self.current = 0;
+            self.place = 0;
         }
     }
 }
