@@ -8,6 +8,9 @@
 //! by a small context of its own (see `choose`). Each set makes its own mixed prediction and learns from its own
 //! error; the mixer's answer is their average.
 //!
+//! The first set is chosen by the bits of the byte known so far (so by the bit's place) and by how much the models
+//! agree: the spread of their stretched predictions, largest minus smallest, in a few buckets.
+//!
 //! It works for any number of inputs: every weight starts at 1 / inputs, the plain average.
 
 use alloc::vec;
@@ -19,7 +22,13 @@ use crate::context::Context;
 const SETS: usize = 3;
 
 /// How many contexts each chooser tells apart.
-const SIZES: [usize; SETS] = [256, 256 * 8, 256 * 8];
+const SIZES: [usize; SETS] = [256 * BUCKETS, 256 * 8, 256 * 8];
+
+/// How many buckets the spread of the inputs falls into.
+const BUCKETS: usize = 4;
+
+/// The spread (largest stretched input minus smallest) is shifted down by this much to give its bucket.
+const SPREAD_SHIFT: u32 = 10;
 
 /// A weight of 1 is 2^16.
 const ONE: i32 = 1 << 16;
@@ -60,17 +69,25 @@ impl Mixer {
     }
 
     /// The context each set of weights is chosen by.
-    fn choose(cx: &Context) -> [usize; SETS] {
+    fn choose(cx: &Context, inputs: &[i32]) -> [usize; SETS] {
+        let mut low = i32::MAX;
+        let mut high = i32::MIN;
+        for &x in inputs {
+            low = low.min(x);
+            high = high.max(x);
+        }
+        let spread = if high > low { (high - low) as usize } else { 0 };
+        let bucket = (spread >> SPREAD_SHIFT).min(BUCKETS - 1);
         let last = (cx.last4 & 0xFF) as usize;
         let before = ((cx.last4 >> 8) & 0xFF) as usize;
-        [cx.partial as usize, (last << 3) | cx.bit as usize, (before << 3) | cx.bit as usize]
+        [cx.partial as usize * BUCKETS + bucket, (last << 3) | cx.bit as usize, (before << 3) | cx.bit as usize]
     }
 
     /// One stretched prediction from the models' stretched predictions.
     pub fn mix(&mut self, cx: &Context, inputs: &[i32]) -> i32 {
         let n = self.inputs;
         self.seen.copy_from_slice(&inputs[..n]);
-        let contexts = Self::choose(cx);
+        let contexts = Self::choose(cx, &self.seen);
         let mut sum = 0;
         for set in 0..SETS {
             let at = self.bases[set] + contexts[set] * n;
