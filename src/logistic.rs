@@ -2,6 +2,9 @@
 //! from -2048 to 2047; `squash` goes back. Predictions are added and weighed on the stretched scale, where a
 //! confident model counts for more than a hesitant one, and squashed once, for the coder.
 //!
+//! Twelve bits are too few where the prediction is nearly sure (the last step before certainty is 1 in 4096,
+//! and the steps before it are as coarse): `squash_fine` gives the same probability out of 65536, for the coder.
+//!
 //! Both are tables, filled when the program starts, with the four operations alone (the program has no
 //! mathematical library): the same tables on every machine.
 
@@ -9,6 +12,7 @@ use alloc::vec::Vec;
 
 pub struct Scale {
     squash: Vec<u16>,
+    fine: Vec<u16>,
     stretch: Vec<i16>,
 }
 
@@ -19,6 +23,11 @@ impl Scale {
             let p = (4096.0 / (1.0 + exp(-(d as f64) / 256.0)) + 0.5) as u32;
             squash.push(p.clamp(1, 4095) as u16);
         }
+        let mut fine = Vec::with_capacity(4096);
+        for d in -2048i32..2048 {
+            let p = (65536.0 / (1.0 + exp(-(d as f64) / 256.0)) + 0.5) as u32;
+            fine.push(p.clamp(1, 65535) as u16);
+        }
         // stretch(p): the first step whose squash reaches p.
         let mut stretch = Vec::with_capacity(4096);
         let mut d = 0usize;
@@ -28,12 +37,19 @@ impl Scale {
             }
             stretch.push((d as i32 - 2048) as i16);
         }
-        Scale { squash, stretch }
+        // A count at the top of its range is as sure as one at the bottom: the far ends are a pair.
+        stretch[4095] = 2047;
+        Scale { squash, fine, stretch }
     }
 
     /// The probability, out of 4096 (1 to 4095), of a stretched prediction.
     pub fn squash(&self, d: i32) -> u32 {
         self.squash[(d.clamp(-2048, 2047) + 2048) as usize] as u32
+    }
+
+    /// The same probability out of 65536 (1 to 65535): sixteen bits, for the coder.
+    pub fn squash_fine(&self, d: i32) -> u32 {
+        self.fine[(d.clamp(-2048, 2047) + 2048) as usize] as u32
     }
 
     /// The stretched prediction (-2048 to 2047) of a probability out of 4096.
