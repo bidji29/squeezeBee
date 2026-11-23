@@ -9,17 +9,25 @@
 //! The six bytes are hashed once a byte, when the byte starts; each bit then only mixes in the bits known so
 //! far, so the work per bit is one multiplication and one look in the table.
 //!
-//! Two predictions, as order 4's: the count's, stretched, and the same scaled by how much the count has seen.
+//! Each slot keeps a second count beside it, which moves fast: 1 / (seen + 1.5) of the way while the counter is
+//! below FAST_LIMIT, then 1 / (FAST_LIMIT + 1.5) for good. The slow count says what the context does on the whole,
+//! the fast one what it did lately; the mixer weighs the two.
+//!
+//! Three predictions: the slow count's, stretched, the same scaled by how much the count has seen, and the fast
+//! count's, stretched.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::context::Context;
 
-pub const OUTPUTS: usize = 2;
+pub const OUTPUTS: usize = 3;
 
 /// The counter stops here: from then on a count moves 1 / (LIMIT + 1.5) of the way.
 const LIMIT: u32 = 30;
+
+/// The fast count's rate stops falling here: from then on it moves 1 / (FAST_LIMIT + 1.5) of the way.
+const FAST_LIMIT: u32 = 6;
 
 /// The table holds 2^BITS slots: few, so that a context comes back to its slot only while it is recent (measured:
 /// smaller tables did better here, down to this size).
@@ -34,6 +42,8 @@ const EMPTY: u32 = 1 << (SEEN_BITS + 15);
 
 pub struct Model {
     slots: Vec<u32>,
+    /// The fast count of each slot, 16 bits, kept with the slot's check (taken over with it).
+    fast: Vec<u16>,
     /// 131072 / (2 seen + 3), for each value of the counter.
     rates: Vec<u32>,
     /// The hash of the six bytes before the byte being coded.
@@ -49,7 +59,7 @@ impl Model {
         for seen in 0..=LIMIT {
             rates.push(131072 / (2 * seen + 3));
         }
-        Model { slots: vec![EMPTY; 1 << BITS], rates, base: 0, slot: 0, check: 0 }
+        Model { slots: vec![EMPTY; 1 << BITS], fast: vec![1 << 15; 1 << BITS], rates, base: 0, slot: 0, check: 0 }
     }
 
     /// The context has the last eight bytes: `history` is not read.
@@ -69,23 +79,29 @@ impl Model {
         if (word ^ self.check) >> (32 - CHECK_BITS) != 0 {
             out[0] = 0;
             out[1] = 0;
+            out[2] = 0;
             return;
         }
         let seen = (word & SEEN_MASK) as i32;
         let said = cx.scale.stretch((word >> (SEEN_BITS + 4)) & 0xFFF);
         out[0] = said;
         out[1] = said * seen / LIMIT as i32;
+        out[2] = cx.scale.stretch((self.fast[self.slot] >> 4) as u32);
     }
 
     pub fn update(&mut self, _cx: &Context, bit: u32) {
         let mut word = self.slots[self.slot];
+        let mut fast = self.fast[self.slot] as i32;
         if (word ^ self.check) >> (32 - CHECK_BITS) != 0 {
             word = EMPTY;
+            fast = 1 << 15;
         }
         let seen = word & SEEN_MASK;
         let p = ((word >> SEEN_BITS) & 0xFFFF) as i32;
         let target = (bit << 16) as i32 - bit as i32;
         let moved = p + (((target - p) as i64 * self.rates[seen as usize] as i64) >> 16) as i32;
+        let quick = self.rates[seen.min(FAST_LIMIT) as usize] as i64;
+        self.fast[self.slot] = (fast + (((target - fast) as i64 * quick) >> 16) as i32) as u16;
         let seen = if seen < LIMIT { seen + 1 } else { seen };
         self.slots[self.slot] = self.check | ((moved as u32) << SEEN_BITS) | seen;
     }
