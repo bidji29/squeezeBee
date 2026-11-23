@@ -22,6 +22,8 @@ pub struct Context {
     /// closed, 0 if none yet. Here a word written as one byte is a word too, with the apostrophes and letters
     /// that follow it: `whole` is the hash of the word so far by that count, and becomes `before` at its end.
     pub before: u32,
+    /// A hash of the word before that one: what `before` was when the word it holds was closed, 0 if none yet.
+    pub before2: u32,
     whole: u32,
     /// How many whole bytes are known.
     pub position: usize,
@@ -59,6 +61,7 @@ impl Context {
             last8: 0,
             word: 0,
             before: 0,
+            before2: 0,
             whole: 0,
             position: 0,
             column: 0,
@@ -83,6 +86,7 @@ impl Context {
             if is_word(byte) || byte >= 128 {
                 self.whole = (self.whole + byte + 1).wrapping_mul(0x2F0B_4A8D);
             } else if self.whole != 0 {
+                self.before2 = self.before;
                 self.before = self.whole;
                 self.whole = 0;
             }
