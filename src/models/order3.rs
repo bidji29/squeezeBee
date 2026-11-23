@@ -1,44 +1,82 @@
-//! Order 3: the three bytes before, and the bits of this byte known so far, choose one count.
+//! Order 3: the three bytes before, and the bits of this byte known so far, choose one slot.
 //! The four values together are 32 bits, too many for a table of their own: a multiplication spreads them
-//! over 2^BITS counts, and two contexts that land on the same count share it (nothing tells them apart).
-//! Each count is 16 bits and moves a sixteenth of the way towards each bit it sees, as order 2's do.
+//! over 2^BITS slots, and two contexts that land on the same slot share it (nothing tells them apart).
+//!
+//! A slot is one 32-bit word that holds two counts, which adapt at two speeds, and a counter:
+//! - on top, a fast count of 11 bits, which moves a quarter of the way towards each bit it sees: it follows
+//!   what the context did lately;
+//! - below it, a slow count of 15 bits, which moves fast while it is new and slower as evidence grows, as
+//!   order 2's does: 1 / (seen + 1.5) of the way, until the counter reaches LIMIT and the rate stays there;
+//! - at the bottom, the counter of the bits seen, 6 bits.
+//!
+//! The model gives both counts as predictions, stretched, and the mixer weighs them.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::context::Context;
 
-pub const OUTPUTS: usize = 1;
+pub const OUTPUTS: usize = 2;
 
-const RATE: u32 = 4;
+/// The fast count moves 1 / 2^FAST of the way.
+const FAST: u32 = 2;
 
-/// The table holds 2^BITS counts.
+/// The counter stops here: from then on the slow count moves 1 / (LIMIT + 1.5) of the way.
+const LIMIT: u32 = 63;
+
+const SEEN_BITS: u32 = 6;
+const SEEN_MASK: u32 = (1 << SEEN_BITS) - 1;
+const SLOW_BITS: u32 = 15;
+const SLOW_MASK: u32 = (1 << SLOW_BITS) - 1;
+const FAST_SHIFT: u32 = SEEN_BITS + SLOW_BITS;
+const FAST_BITS: u32 = 32 - FAST_SHIFT;
+
+/// The table holds 2^BITS slots.
 const BITS: u32 = 22;
 
 /// An odd multiplier near 2^32 divided by the golden ratio: it sends the 2^32 contexts each to its own
 /// 32-bit value, whose high bits are the slot.
 const SPREAD: u32 = 0x9E37_79B1;
 
+/// A slot that has seen nothing: both counts at one half.
+const EMPTY: u32 = (1 << 31) | (1 << (SEEN_BITS + SLOW_BITS - 1));
+
 pub struct Model {
-    counts: Vec<u16>,
+    slots: Vec<u32>,
+    /// 131072 / (2 seen + 3), for each value of the counter.
+    rates: Vec<u32>,
     slot: usize,
 }
 
 impl Model {
     pub fn new() -> Self {
-        Model { counts: vec![1 << 15; 1 << BITS], slot: 0 }
+        let mut rates = Vec::with_capacity(LIMIT as usize + 1);
+        for seen in 0..=LIMIT {
+            rates.push(131072 / (2 * seen + 3));
+        }
+        Model { slots: vec![EMPTY; 1 << BITS], rates, slot: 0 }
     }
 
     /// `history` holds the whole bytes coded so far (this model looks at the last three, which the context has).
     pub fn predict(&mut self, cx: &Context, _history: &[u8], out: &mut [i32]) {
         let context = (cx.last4 << 8) | cx.partial;
         self.slot = (context.wrapping_mul(SPREAD) >> (32 - BITS)) as usize;
-        out[0] = cx.scale.stretch((self.counts[self.slot] >> 4) as u32);
+        let word = self.slots[self.slot];
+        // Both counts as probabilities out of 4096.
+        out[0] = cx.scale.stretch((word >> FAST_SHIFT) << (12 - FAST_BITS));
+        out[1] = cx.scale.stretch((word >> (SEEN_BITS + SLOW_BITS - 12)) & 0xFFF);
     }
 
     pub fn update(&mut self, _cx: &Context, bit: u32) {
-        let p = self.counts[self.slot] as u32;
-        let moved = if bit == 1 { p + ((65536 - p) >> RATE) } else { p - (p >> RATE) };
-        self.counts[self.slot] = moved as u16;
+        let word = self.slots[self.slot];
+        let fast = word >> FAST_SHIFT;
+        let slow = ((word >> SEEN_BITS) & SLOW_MASK) as i32;
+        let seen = word & SEEN_MASK;
+        let fast = if bit == 1 { fast + (((1 << FAST_BITS) - fast) >> FAST) } else { fast - (fast >> FAST) };
+        // The slow count goes towards 0 or towards the top of its 15 bits.
+        let target = (bit << SLOW_BITS) as i32 - bit as i32;
+        let slow = slow + (((target - slow) * self.rates[seen as usize] as i32) >> 16);
+        let seen = if seen < LIMIT { seen + 1 } else { seen };
+        self.slots[self.slot] = (fast << FAST_SHIFT) | ((slow as u32) << SEEN_BITS) | seen;
     }
 }
