@@ -3,8 +3,11 @@
 //! An index sends a hash of the last SEED bytes to the places just after their last two occurrences. Two
 //! matches are held. While one of them is missing, each new byte looks its places up; a place found, that the
 //! other match is not already at, is checked by walking back from it, which gives the true length of the match
-//! (up to REACH). While a match is held, each new byte either agrees with the byte the match foretold, and the
-//! match grows by one, or does not, and the match is dropped: the other one, if it foretold that byte, goes on.
+//! (up to REACH). Before that, a second index, on a hash of the last LONG bytes, gives the last place of that
+//! longer run: checked the same way, a match of at least LONG bytes found there takes the place of the missing
+//! match, or of the shorter one held. While a match is held, each new byte either agrees with the byte the match
+//! foretold, and the match grows by one, or does not, and the match is dropped: the other one, if it foretold that
+//! byte, goes on.
 //!
 //! The byte foretold is the longer match's. During a byte, as long as the bits coded agree with it, the model
 //! says the bit that byte has next. How sure it is, is learnt: a count of how often the foretold bit came true,
@@ -32,6 +35,12 @@ const SEED: usize = 7;
 /// The index holds 2^BITS pairs of places.
 const BITS: u32 = 22;
 
+/// How many of the last bytes the second index hashes: a longer run, looked up first.
+const LONG: usize = 12;
+
+/// The second index holds 2^LONG_BITS places.
+const LONG_BITS: u32 = 24;
+
 /// A match is not measured beyond this length.
 const REACH: usize = 400;
 
@@ -52,6 +61,8 @@ const WEIGHTY: usize = 12;
 pub struct Model {
     /// For each hash, the last two places: the most recent first.
     index: Vec<u32>,
+    /// For each hash of the last LONG bytes, the last place.
+    long_index: Vec<u32>,
     /// How often the foretold bit came true, out of 65536: for each view of the other match, for each class of
     /// length, for each bit of a byte.
     sure: Vec<u16>,
@@ -87,6 +98,7 @@ impl Model {
     pub fn new() -> Self {
         Model {
             index: vec![0; 2 << BITS],
+            long_index: vec![0; 1 << LONG_BITS],
             sure: vec![49152; VIEWS * CLASSES * 8],
             side: vec![49152; 1 << SIDE_BITS],
             place: [0; 2],
@@ -114,6 +126,35 @@ impl Model {
                     self.length[m] = 0;
                 }
             }
+        }
+        if n >= LONG {
+            let mut h: u32 = 0;
+            for &b in &history[n - LONG..] {
+                h = (h ^ b as u32).wrapping_mul(0x2F0B_3A49);
+            }
+            let slot = (h >> (32 - LONG_BITS)) as usize;
+            let found = self.long_index[slot] as usize;
+            // The free match, else the shorter one.
+            let free = if self.length[0] == 0 {
+                0
+            } else if self.length[1] == 0 {
+                1
+            } else if self.length[0] < self.length[1] {
+                0
+            } else {
+                1
+            };
+            if found > 0 && !(self.length[1 - free] > 0 && self.place[1 - free] == found) {
+                let mut length = 0;
+                while length < REACH && length < found && history[found - 1 - length] == history[n - 1 - length] {
+                    length += 1;
+                }
+                if length >= LONG && length > self.length[free] {
+                    self.length[free] = length;
+                    self.place[free] = found;
+                }
+            }
+            self.long_index[slot] = n as u32;
         }
         if n >= SEED {
             let seed = cx.last8 & ((1u64 << (8 * SEED)) - 1);
