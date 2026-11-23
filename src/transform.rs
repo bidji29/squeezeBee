@@ -6,8 +6,11 @@
 //!   a capital (and before each capital of a word of mixed case), UP before a word of two letters or more that is
 //!   all capitals. A word is a longest run of ASCII letters;
 //! - the curly quotes and the long dash, three bytes each in UTF-8, are written as one byte each;
-//! - the most frequent words are written as one byte each, from 128 up, after their marker if they have one.
-//! A byte of the data that would be taken for one of these (1 to 8, or 128 and more) is written after ESC.
+//! - the most frequent words are written as one byte each, after their marker if they have one: the first 128 as
+//!   the bytes from 128 up, the next ones as bytes below 128 that this kind of text does not use (MORE). The
+//!   list is in the order of what its words save, which follows how often they come more than how long they are.
+//! A byte of the data that would be taken for one of these (1 to 8, 128 and more, or one of MORE) is written
+//! after ESC.
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
@@ -22,14 +25,36 @@ const FIRST_MARK: u8 = 4;
 
 /// The words written as one byte, the first as 128: the ones that save most on this kind of text.
 const FIRST_WORD: u8 = 128;
+/// The bytes of the words after the first 128, one bit each, the lowest byte for the first of them: control bytes
+/// and signs that prose and verse leave unused.
+const MORE: u128 = bits(0, 0) | bits(11, 31) | bits(34, 37) | bits(43, 43) | bits(60, 62) | bits(64, 64)
+    | bits(92, 92) | bits(94, 94) | bits(96, 96) | bits(123, 127);
 const WORDS: &str = "\
-    the and that with you to of have this his for not in your what was her but my which there will it \
-    him would shall thou said he when she from is all little should me they had their as good more were \
-    be come are then know before here upon well them never like thee enter lord than now where king so \
-    think very could been sir our love nothing thy at these first on some one such another again \
-    gentleman out time being richard himself about myself father great much make thought by must how \
-    into if we no though man other house without say scene night heart better mr therefore who do take \
-    down something hath speak made hand might micawber friend lady let";
+    the and you that to of with his for not in was her but have my this it him your he what she is all me had \
+    will as be thou are said when which from there now they so would sir shall our good thy at on more were one \
+    out come then know by here upon well how them if like we no thee man their lord say than king mr who do very \
+    been little should let love some did see such may time never can much enter make or must where into think \
+    could yet too old before why any these first am has an take down hath made again hand lady being about dear \
+    great give mrs day away look most other house tell own don scene way up two night head ll heart life miss \
+    eyes myself tis mine speak ever father us might nothing after face go young another though long says richard \
+    still himself done better over hear thought";
+
+/// The bits `from` to `to`, both included.
+const fn bits(from: u32, to: u32) -> u128 {
+    ((1 << (to - from + 1)) - 1) << from
+}
+
+/// The place in the list of the word a byte stands for, if it stands for one.
+#[inline(always)]
+fn place(b: u8) -> Option<usize> {
+    if b >= FIRST_WORD {
+        Some((b - FIRST_WORD) as usize)
+    } else if MORE >> b & 1 != 0 {
+        Some(128 + (MORE & ((1 << b) - 1)).count_ones() as usize)
+    } else {
+        None
+    }
+}
 
 fn is_letter(b: u8) -> bool {
     b.is_ascii_alphabetic()
@@ -38,6 +63,9 @@ fn is_letter(b: u8) -> bool {
 /// The text the models are given for the data.
 pub fn forward(data: &[u8]) -> Cow<'_, [u8]> {
     let words: Vec<&[u8]> = WORDS.split(' ').map(|word| word.as_bytes()).collect();
+    // The byte of each word of the list, in the list's order.
+    let mut codes: Vec<u8> = (FIRST_WORD..=255).collect();
+    codes.extend((0..FIRST_WORD).filter(|&b| MORE >> b & 1 != 0));
     let mut out = Vec::with_capacity(data.len());
     let mut small: Vec<u8> = Vec::new();
     let mut i = 0;
@@ -74,8 +102,8 @@ pub fn forward(data: &[u8]) -> Cow<'_, [u8]> {
             }
             small.clear();
             small.extend(word.iter().map(|c| c.to_ascii_lowercase()));
-            match words.iter().position(|entry| *entry == &small[..]) {
-                Some(found) => out.push(FIRST_WORD + found as u8),
+            match words.iter().position(|entry| *entry == &small[..]).and_then(|found| codes.get(found)) {
+                Some(&code) => out.push(code),
                 None => out.extend_from_slice(&small),
             }
             i = j;
@@ -84,7 +112,7 @@ pub fn forward(data: &[u8]) -> Cow<'_, [u8]> {
             out.push(FIRST_MARK + which as u8);
             i += 3;
         } else {
-            if (b >= ESC && b < FIRST_MARK + MARKS.len() as u8) || b >= FIRST_WORD {
+            if (b >= ESC && b < FIRST_MARK + MARKS.len() as u8) || place(b).is_some() {
                 out.push(ESC);
             }
             out.push(b);
@@ -104,8 +132,8 @@ pub fn inverse(text: Vec<u8>) -> Vec<u8> {
     while i < text.len() {
         let b = text[i];
         i += 1;
-        if b >= FIRST_WORD {
-            let word = match words.get((b - FIRST_WORD) as usize) {
+        if let Some(place) = place(b) {
+            let word = match words.get(place) {
                 Some(word) => *word,
                 None => &[],
             };
