@@ -6,7 +6,9 @@
 //!
 //! What a model is worth depends on where the coding stands, so there are several sets of weights, each chosen
 //! by a small context of its own (see `choose`). Each set makes its own mixed prediction and learns from its own
-//! error; the mixer's answer is their average.
+//! error. The mixer's answer weighs the sets' predictions once more, with weights of its own that learn as the
+//! first ones do, slowly, and start as the plain average; they are chosen by the top three bits of the last byte
+//! and the bits of the current byte known so far.
 //!
 //! It works for any number of inputs: every weight starts at 1 / inputs, the plain average.
 
@@ -27,6 +29,9 @@ const ONE: i32 = 1 << 16;
 /// The error (out of 2^16) times the input (steps of 1/256) is shifted down by this much before it moves a weight.
 const RATE: u32 = 13;
 
+/// The same for the weights that weigh the sets' predictions.
+const FINAL_RATE: u32 = 17;
+
 pub struct Mixer {
     inputs: usize,
     /// All the weights: for each set, for each of its contexts, one weight per input.
@@ -38,6 +43,11 @@ pub struct Mixer {
     /// Where the weights chosen for this bit start, for each set, and what each set predicted (stretched).
     chosen: [usize; SETS],
     said: [i32; SETS],
+    /// The weights of the sets' predictions, SETS for each of the 2048 contexts (the top three bits of the last
+    /// byte, the bits known so far); where the ones chosen for this bit start, and what they made of them.
+    last: Vec<i32>,
+    last_at: usize,
+    answer: i32,
 }
 
 impl Mixer {
@@ -56,6 +66,9 @@ impl Mixer {
             seen: vec![0; inputs],
             chosen: [0; SETS],
             said: [0; SETS],
+            last: vec![ONE / SETS as i32; 2048 * SETS],
+            last_at: 0,
+            answer: 0,
         }
     }
 
@@ -72,7 +85,9 @@ impl Mixer {
         let n = self.inputs;
         self.seen.copy_from_slice(&inputs[..n]);
         let contexts = Self::choose(cx);
-        let mut sum = 0;
+        let mut sum = 0i64;
+        let last_at = (((cx.last4 & 0xE0) << 3 | cx.partial) as usize) * SETS;
+        self.last_at = last_at;
         for set in 0..SETS {
             let at = self.bases[set] + contexts[set] * n;
             self.chosen[set] = at;
@@ -82,14 +97,19 @@ impl Mixer {
             }
             let said = ((dot >> 16) as i32).clamp(-2047, 2047);
             self.said[set] = said;
-            sum += said;
+            sum += self.last[last_at + set] as i64 * said as i64;
         }
-        sum / SETS as i32
+        self.answer = ((sum >> 16) as i32).clamp(-2047, 2047);
+        self.answer
     }
 
     /// Told the bit that came, before the context moves on.
     pub fn update(&mut self, cx: &Context, bit: u32) {
         let n = self.inputs;
+        let error = ((bit << 16) as i32) - cx.scale.squash_fine(self.answer) as i32;
+        for set in 0..SETS {
+            self.last[self.last_at + set] += (self.said[set] * error) >> FINAL_RATE;
+        }
         for set in 0..SETS {
             let error = ((bit << 16) as i32) - cx.scale.squash_fine(self.said[set]) as i32;
             let at = self.chosen[set];
