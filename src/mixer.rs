@@ -16,10 +16,10 @@ use alloc::vec::Vec;
 use crate::context::Context;
 
 /// How many sets of weights are chosen at each bit, each by its own context.
-const SETS: usize = 3;
+const SETS: usize = 4;
 
 /// How many contexts each chooser tells apart.
-const SIZES: [usize; SETS] = [256 * 256; SETS];
+const SIZES: [usize; SETS] = [256 * 256, 256 * 256, 256 * 256, 256];
 
 /// A weight of 1 is 2^16.
 const ONE: i32 = 1 << 16;
@@ -59,12 +59,13 @@ impl Mixer {
         }
     }
 
-    /// The context each set of weights is chosen by: one of the last three whole bytes, and the bits of the
-    /// current byte known so far (which also give the bit's place).
+    /// The context each set of weights is chosen by: for the first three, one of the last three whole bytes and
+    /// the bits of the current byte known so far (which also give the bit's place); for the last, the previous
+    /// whole byte alone.
     fn choose(cx: &Context) -> [usize; SETS] {
         let partial = cx.partial as usize;
         let byte = |back: u32| ((cx.last4 >> (8 * back)) & 0xFF) as usize;
-        [(byte(2) << 8) | partial, (byte(0) << 8) | partial, (byte(1) << 8) | partial]
+        [(byte(2) << 8) | partial, (byte(0) << 8) | partial, (byte(1) << 8) | partial, byte(0)]
     }
 
     /// One stretched prediction from the models' stretched predictions.
@@ -76,15 +77,12 @@ impl Mixer {
         for set in 0..SETS {
             let at = self.bases[set] + contexts[set] * n;
             self.chosen[set] = at;
-            let mut dot = 0i64;
-            for (w, x) in self.weights[at..at + n].iter().zip(self.seen.iter()) {
-                dot += *w as i64 * *x as i64;
-            }
+            let dot = dot(&self.weights[at..at + n], &self.seen);
             let said = ((dot >> 16) as i32).clamp(-2047, 2047);
             self.said[set] = said;
             sum += said;
         }
-        sum / SETS as i32
+        sum >> 2
     }
 
     /// Told the bit that came, before the context moves on.
@@ -93,9 +91,25 @@ impl Mixer {
         for set in 0..SETS {
             let error = ((bit << 16) as i32) - cx.scale.squash_fine(self.said[set]) as i32;
             let at = self.chosen[set];
-            for (w, x) in self.weights[at..at + n].iter_mut().zip(self.seen.iter()) {
-                *w += (*x * error) >> RATE;
-            }
+            learn(&mut self.weights[at..at + n], &self.seen, error);
         }
+    }
+}
+
+/// The weighted sum of one set's weights and the inputs. Kept as one copy of the loop, shared by every set.
+#[inline(never)]
+fn dot(weights: &[i32], seen: &[i32]) -> i64 {
+    let mut dot = 0i64;
+    for (w, x) in weights.iter().zip(seen.iter()) {
+        dot += *w as i64 * *x as i64;
+    }
+    dot
+}
+
+/// Moves one set's weights by its error times what each input said. One copy of the loop, as for `dot`.
+#[inline(never)]
+fn learn(weights: &mut [i32], seen: &[i32], error: i32) {
+    for (w, x) in weights.iter_mut().zip(seen.iter()) {
+        *w += (*x * error) >> RATE;
     }
 }
