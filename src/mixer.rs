@@ -19,7 +19,7 @@ use crate::context::Context;
 const SETS: usize = 3;
 
 /// How many contexts each chooser tells apart.
-const SIZES: [usize; SETS] = [256, 256 * 8, 256 * 8];
+const SIZES: [usize; SETS] = [256 * 256; SETS];
 
 /// A weight of 1 is 2^16.
 const ONE: i32 = 1 << 16;
@@ -59,11 +59,12 @@ impl Mixer {
         }
     }
 
-    /// The context each set of weights is chosen by.
+    /// The context each set of weights is chosen by: one of the last three whole bytes, and the bits of the
+    /// current byte known so far (which also give the bit's place).
     fn choose(cx: &Context) -> [usize; SETS] {
-        let last = (cx.last4 & 0xFF) as usize;
-        let before = ((cx.last4 >> 8) & 0xFF) as usize;
-        [cx.partial as usize, (last << 3) | cx.bit as usize, (before << 3) | cx.bit as usize]
+        let partial = cx.partial as usize;
+        let byte = |back: u32| ((cx.last4 >> (8 * back)) & 0xFF) as usize;
+        [(byte(2) << 8) | partial, (byte(0) << 8) | partial, (byte(1) << 8) | partial]
     }
 
     /// One stretched prediction from the models' stretched predictions.
