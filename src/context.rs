@@ -18,6 +18,11 @@ pub struct Context {
     pub last8: u64,
     /// A hash of the word being written: of the letters and apostrophes since the last other byte, 0 if none.
     pub word: u32,
+    /// A hash of the word before the one being written: of the last whole word that a byte of no word has
+    /// closed, 0 if none yet. Here a word written as one byte is a word too, with the apostrophes and letters
+    /// that follow it: `whole` is the hash of the word so far by that count, and becomes `before` at its end.
+    pub before: u32,
+    whole: u32,
     /// How many whole bytes are known.
     pub position: usize,
     /// How many whole bytes are known since the last line feed: the column of the byte being coded.
@@ -53,6 +58,8 @@ impl Context {
             last4: 0,
             last8: 0,
             word: 0,
+            before: 0,
+            whole: 0,
             position: 0,
             column: 0,
             line: 0,
@@ -73,6 +80,12 @@ impl Context {
             self.last4 = (self.last4 << 8) | byte;
             self.last8 = (self.last8 << 8) | byte as u64;
             self.word = if is_word(byte) { (self.word + byte + 1).wrapping_mul(0x2F0B_4A8D) } else { 0 };
+            if is_word(byte) || byte >= 128 {
+                self.whole = (self.whole + byte + 1).wrapping_mul(0x2F0B_4A8D);
+            } else if self.whole != 0 {
+                self.before = self.whole;
+                self.whole = 0;
+            }
             self.position += 1;
             if byte == 10 {
                 self.above = self.line;
