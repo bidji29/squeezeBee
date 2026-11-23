@@ -10,8 +10,9 @@
 //!
 //! A slot is one 32-bit word: the check on top, a count of 16 bits, and a counter of the bits seen at the
 //! bottom. A new count moves fast and an old one slowly, 1 / (seen + 1.5) of the way until the counter reaches
-//! LIMIT. As in order 4 the model gives two predictions: the count's, stretched, and the same scaled by how
-//! much the count has seen.
+//! LIMIT, near the top of its 8 bits: a pair seen often keeps slowing, so that its count settles on what the pair
+//! does rather than on its last few bits. As in order 4 the model gives two predictions: the count's, stretched,
+//! and the same scaled by how much the count has seen, up to WORTH.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -21,7 +22,10 @@ use crate::context::Context;
 pub const OUTPUTS: usize = 2;
 
 /// The counter stops here: from then on a count moves 1 / (LIMIT + 1.5) of the way.
-const LIMIT: u32 = 30;
+const LIMIT: u32 = 250;
+
+/// The second prediction is scaled by the counter up to here.
+const WORTH: u32 = 30;
 
 /// The table holds 2^BITS slots.
 const BITS: u32 = 24;
@@ -70,10 +74,10 @@ impl Model {
             out[1] = 0;
             return;
         }
-        let seen = (word & SEEN_MASK) as i32;
+        let seen = (word & SEEN_MASK).min(WORTH) as i32;
         let said = cx.scale.stretch((word >> (SEEN_BITS + 4)) & 0xFFF);
         out[0] = said;
-        out[1] = said * seen / LIMIT as i32;
+        out[1] = said * seen / WORTH as i32;
     }
 
     pub fn update(&mut self, _cx: &Context, bit: u32) {
