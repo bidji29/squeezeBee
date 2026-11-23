@@ -37,6 +37,10 @@ const START: u32 = 2;
 /// What the contexts add is given this many 64ths of its weight.
 const WEIGHT: i32 = 64;
 
+/// The second stage: one more table, read with what the first stage gives, in a context of its own.
+const SECOND_BITS: u32 = 3;
+const SECOND_LIMIT: u32 = 1023;
+
 pub struct Refine {
     tables: [Vec<u32>; TABLES + 1],
     /// One over n + 1.5, out of 2^16, for each count.
@@ -44,6 +48,11 @@ pub struct Refine {
     /// For the bit being coded: where each table's first cut is, and how far past it the prediction was.
     at: [usize; TABLES + 1],
     part: u32,
+    /// The second stage's table, and for the bit being coded its first cut and how far past it the first
+    /// stage's prediction was.
+    second: Vec<u32>,
+    second_at: usize,
+    second_part: u32,
 }
 
 impl Refine {
@@ -69,6 +78,9 @@ impl Refine {
             over,
             at: [0; TABLES + 1],
             part: 0,
+            second: table(SECOND_BITS),
+            second_at: 0,
+            second_part: 0,
         }
     }
 
@@ -107,7 +119,28 @@ impl Refine {
         // In sixteenths of a step of the probability out of 4096, which is what the frame carries over.
         let add = (sum * WEIGHT) / (TABLES as i32 * 64);
         let moved = p as i32 + (add + if add >= 0 { 8 } else { -8 }) / 16;
-        moved.max(0) as u32
+        // The second stage: what the first one gives, corrected in the context of the bit's place alone.
+        let first = cx.scale.stretch(moved.clamp(1, 4095) as u32);
+        let d = (first + 2048) as u32;
+        let part = d & ((1 << STEP) - 1);
+        let at = Self::second_context(cx) * CUTS + (d >> STEP) as usize;
+        self.second_at = at;
+        self.second_part = part;
+        let below = self.second[at] >> 16;
+        let above = self.second[at + 1] >> 16;
+        let again = (below * (whole - part) + above * part) >> (STEP + 4);
+        let second = cx.scale.stretch(again.clamp(1, 4095));
+        // The two corrected predictions and the input, averaged on the stretched scale; what the average
+        // changes of the input is what the step gives, so that no correction at all changes nothing.
+        let input = cx.scale.stretch(p);
+        let mean = (input + first + second + 3 * 2048 + 1) / 3 - 2048;
+        let given = p as i32 + cx.scale.squash(mean) as i32 - cx.scale.squash(input) as i32;
+        given.max(0) as u32
+    }
+
+    /// The second stage's context: the place of the bit in its byte.
+    fn second_context(cx: &Context) -> usize {
+        cx.bit as usize
     }
 
     /// Told the bit that came, before the context moves on.
@@ -126,6 +159,15 @@ impl Refine {
                 let p = p + (((target - p) * rate * share) >> (16 + STEP));
                 *slot = (p as u32) << 10 | if count < limit { count + 1 } else { count };
             }
+        }
+        let at = self.second_at;
+        let part = self.second_part as i64;
+        for (slot, share) in self.second[at..at + 2].iter_mut().zip([whole - part, part]) {
+            let count = *slot & 1023;
+            let p = (*slot >> 10) as i64;
+            let rate = self.over[count as usize] as i64;
+            let p = p + (((target - p) * rate * share) >> (16 + STEP));
+            *slot = (p as u32) << 10 | if count < SECOND_LIMIT { count + 1 } else { count };
         }
     }
 }
