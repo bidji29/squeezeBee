@@ -9,6 +9,9 @@
 //! error; the mixer's answer is their average.
 //!
 //! It works for any number of inputs: every weight starts at 1 / inputs, the plain average.
+//!
+//! Each set also has one more input, a constant (`BIAS`), with its own weight learnt by the same rule as the
+//! others: it lets a set lean towards 0 or 1 by itself where its context calls for it. Its weight starts at 0.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -36,15 +39,18 @@ const LEAST: i64 = 6;
 /// The count stops here: past it the rate is the least one for good.
 const CAP: u16 = 1023;
 
+/// The constant input each set has besides the models' (4, in the inputs' steps of 1/256).
+const BIAS: i32 = 1024;
+
 pub struct Mixer {
     inputs: usize,
-    /// All the weights: for each set, for each of its contexts, one weight per input.
+    /// All the weights: for each set, for each of its contexts, one weight per input, then the bias's.
     weights: Vec<i32>,
     /// For each set, for each of its contexts, how many updates its weights have had.
     counts: Vec<u16>,
     /// Where each set's contexts start in `weights`.
     bases: [usize; SETS],
-    /// The inputs of the bit being coded.
+    /// The inputs of the bit being coded, then the bias.
     seen: Vec<i32>,
     /// Where the weights chosen for this bit start, for each set, and what each set predicted (stretched).
     chosen: [usize; SETS],
@@ -60,14 +66,20 @@ impl Mixer {
         for set in 0..SETS {
             slots += SIZES[set];
             bases[set] = total;
-            total += SIZES[set] * inputs;
+            total += SIZES[set] * (inputs + 1);
         }
+        let mut weights = vec![ONE / inputs.max(1) as i32; total];
+        for bias in weights.iter_mut().skip(inputs).step_by(inputs + 1) {
+            *bias = 0;
+        }
+        let mut seen = vec![0; inputs + 1];
+        seen[inputs] = BIAS;
         Mixer {
             inputs,
-            weights: vec![ONE / inputs.max(1) as i32; total],
+            weights,
             counts: vec![0; slots],
             bases,
-            seen: vec![0; inputs],
+            seen,
             chosen: [0; SETS],
             said: [0; SETS],
         }
@@ -84,7 +96,8 @@ impl Mixer {
     /// One stretched prediction from the models' stretched predictions.
     pub fn mix(&mut self, cx: &Context, inputs: &[i32]) -> i32 {
         let n = self.inputs;
-        self.seen.copy_from_slice(&inputs[..n]);
+        self.seen[..n].copy_from_slice(&inputs[..n]);
+        let n = n + 1;
         let contexts = Self::choose(cx);
         let mut sum = 0;
         for set in 0..SETS {
@@ -103,11 +116,11 @@ impl Mixer {
 
     /// Told the bit that came, before the context moves on.
     pub fn update(&mut self, cx: &Context, bit: u32) {
-        let n = self.inputs;
+        let n = self.inputs + 1;
         for set in 0..SETS {
             let error = ((bit << 16) as i32) - cx.scale.squash_fine(self.said[set]) as i32;
             let at = self.chosen[set];
-            let slot = if n == 0 { 0 } else { at / n };
+            let slot = at / n;
             let count = self.counts[slot];
             if count < CAP {
                 self.counts[slot] = count + 1;
