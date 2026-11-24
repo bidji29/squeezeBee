@@ -43,6 +43,13 @@ const DEEP_CUTS: usize = (4096 >> DEEP_STEP) + 1;
 /// A cut that has seen n bits moves 1 / (n + 1.5) of the way, times its share of the line, until n is DEEP_LIMIT.
 const DEEP_LIMIT: u32 = 255;
 
+/// The refining step's say is averaged with the mixer's own, on the stretched scale: the refined prediction
+/// counts for SHARE_REFINED eighths, the unrefined for the rest, and the average is squashed back.
+const SHARE_REFINED: i32 = 7;
+
+/// The stretched scale in finer steps, for that average: 2^FINE of them for each of its own.
+const FINE: u32 = 4;
+
 /// The pairs of weights the first pass tries: CHOICES of them, four weights for each correction.
 const CHOICES: usize = 16;
 
@@ -78,6 +85,8 @@ struct Predictor {
     deeper: i32,
     /// The weights of the two corrections.
     choice: usize,
+    /// The stretched scale of a probability out of 65536, in steps of 1/2^FINE of its own (see FINE).
+    logit: Vec<i32>,
 }
 
 impl Predictor {
@@ -112,7 +121,19 @@ impl Predictor {
             refined: 0,
             deeper: 0,
             choice,
+            logit: logits(&cx_scale_fine()),
         }
+    }
+
+    /// The probability, out of 65536, of a point of the stretched scale in steps of 1/2^FINE: the line between the
+    /// two squashed steps around it.
+    fn squash_finer(&self, x: i32) -> i32 {
+        let x = x.clamp(-2048 << FINE, (2047 << FINE) - 1);
+        let d = x >> FINE;
+        let part = x & ((1 << FINE) - 1);
+        let lo = self.cx.scale.squash_fine(d) as i32;
+        let hi = self.cx.scale.squash_fine(d + 1) as i32;
+        lo + (((hi - lo) * part + (1 << (FINE - 1))) >> FINE)
     }
 
     /// The probability, out of 65536, that the bit to come is 1; `history` is the whole bytes coded so far.
@@ -129,7 +150,14 @@ impl Predictor {
         let below = self.learnt[self.node] as u64 * (whole - self.part) as u64;
         let above = self.learnt[self.node + 1] as u64 * self.part as u64;
         self.seen = ((below + above) >> (STEP + 14)) as i32;
-        self.refined = refined as i32 - coarse as i32;
+        // The average, on the stretched scale, of the refined prediction and the mixer's own: what the refining
+        // step moved, stretched, is given its share, added to the mixed prediction, and squashed back.
+        let at = |p: u32| self.logit[(p.clamp(1, 4095) << 4 | 8) as usize];
+        let moved = at(refined) - at(coarse);
+        let base = mixed.clamp(-2048, 2047) << FINE;
+        let averaged = self.squash_finer(base + moved * SHARE_REFINED / 8) - self.squash_finer(base);
+        // In steps of 1/65536, where the weights of a choice take steps of 1/4096: they count it in sixteenths.
+        self.refined = averaged;
         let hash = ((cx_six(&self.cx).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u32)
             ^ self.cx.partial.wrapping_mul(0xC2B2_AE35);
         self.deep_at = (hash >> (32 - DEEP_BITS)) as usize * DEEP_CUTS + (d >> DEEP_STEP) as usize;
@@ -143,7 +171,7 @@ impl Predictor {
     /// The probability for the bit to come, had the corrections the weights of this choice.
     fn weigh(&self, choice: usize) -> u32 {
         let (refined, deeper) = weights(choice);
-        (self.seen + self.refined * refined + self.deeper * deeper / 16).clamp(1, 65535) as u32
+        (self.seen + (self.refined * refined + self.deeper * deeper) / 16).clamp(1, 65535) as u32
     }
 
     fn update(&mut self, bit: u32) {
@@ -164,6 +192,33 @@ impl Predictor {
         }
         self.cx.push(bit);
     }
+}
+
+/// The squashed scale out of 65536, step by step (-2048 to 2047).
+fn cx_scale_fine() -> Vec<u32> {
+    let scale = crate::logistic::Scale::new();
+    (-2048..2048).map(|d| scale.squash_fine(d)).collect()
+}
+
+/// For each probability out of 65536, its point on the stretched scale in steps of 1/2^FINE: between the two
+/// steps whose squashed probabilities hold it, the line between them.
+fn logits(fine: &[u32]) -> Vec<i32> {
+    let mut table = vec![0i32; 65536];
+    let mut d = 0usize;
+    for (p, slot) in table.iter_mut().enumerate() {
+        let p = p as u32;
+        while d + 1 < fine.len() && fine[d + 1] <= p {
+            d += 1;
+        }
+        let lo = fine[d];
+        let point = ((d as i32) - 2048) << FINE;
+        *slot = if d + 1 < fine.len() && fine[d + 1] > lo && p >= lo {
+            point + (((p - lo) << FINE) / (fine[d + 1] - lo)) as i32
+        } else {
+            point
+        };
+    }
+    table
 }
 
 /// The six whole bytes before.
