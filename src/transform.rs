@@ -8,6 +8,9 @@
 //! - the curly quotes and the long dash, three bytes each in UTF-8, are written as one byte each;
 //! - the most frequent words are written as one byte each, from 128 up, after their marker if they have one.
 //! A byte of the data that would be taken for one of these (1 to 8, or 128 and more) is written after ESC.
+//!
+//! Before those, the line breaks of wrapped prose are written as spaces (see `unwrap`), so that the models see
+//! the words of a paragraph run on as they do inside a line.
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
@@ -35,8 +38,110 @@ fn is_letter(b: u8) -> bool {
     b.is_ascii_alphabetic()
 }
 
+/// The width prose is wrapped at, in characters: a line break is put back where the next word would not fit.
+const WIDTH: usize = 72;
+
+/// Before a space that the rule would take for a line break, and before itself: the next byte is the data's own.
+const KEEP: u8 = 0x1F;
+
+/// Whether a byte starts a character (UTF-8: it is not a continuation byte).
+fn starts_char(b: u8) -> bool {
+    b & 0xC0 != 0x80
+}
+
+/// The rule: at a space or a line break, after a line of `line` characters, with a word of `word` characters
+/// next, the line breaks there if the word does not fit.
+fn breaks(line: usize, word: usize) -> bool {
+    word >= 1 && line + 1 + word > WIDTH
+}
+
+/// The data with each line break that the rule gives written as a space, and each space that the rule would take
+/// for a line break written after KEEP (and KEEP itself after KEEP): `wrap` puts them back exactly.
+fn unwrap(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 16);
+    let mut line = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b == b' ' || b == b'\n' {
+            let mut word = 0;
+            let mut j = i + 1;
+            while j < data.len() && data[j] != b' ' && data[j] != b'\n' {
+                if starts_char(data[j]) {
+                    word += 1;
+                }
+                j += 1;
+            }
+            let rule = breaks(line, word);
+            if b == b'\n' {
+                out.push(if rule { b' ' } else { b'\n' });
+                line = 0;
+            } else {
+                if rule {
+                    out.push(KEEP);
+                }
+                out.push(b' ');
+                line += 1;
+            }
+        } else {
+            if b == KEEP {
+                out.push(KEEP);
+            }
+            out.push(b);
+            if starts_char(b) {
+                line += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The data, from what `unwrap` made of it.
+fn wrap(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + text.len() / 64);
+    let mut line = 0;
+    let mut i = 0;
+    while i < text.len() {
+        let mut b = text[i];
+        i += 1;
+        if b == KEEP {
+            if i < text.len() {
+                b = text[i];
+                i += 1;
+            }
+        } else if b == b' ' {
+            let mut word = 0;
+            let mut j = i;
+            while j < text.len() && text[j] != b' ' && text[j] != b'\n' {
+                if text[j] == KEEP {
+                    if j + 1 < text.len() && text[j + 1] == b' ' {
+                        break;
+                    }
+                    j += 1;
+                    if j < text.len() && starts_char(text[j]) {
+                        word += 1;
+                    }
+                } else if starts_char(text[j]) {
+                    word += 1;
+                }
+                j += 1;
+            }
+            if breaks(line, word) {
+                b = b'\n';
+            }
+        }
+        out.push(b);
+        if b == b'\n' {
+            line = 0;
+        } else if starts_char(b) {
+            line += 1;
+        }
+    }
+    out
+}
+
 /// The text the models are given for the data.
 pub fn forward(data: &[u8]) -> Cow<'_, [u8]> {
+    let unwrapped = unwrap(data);
+    let data = &unwrapped[..];
     let words: Vec<&[u8]> = WORDS.split(' ').map(|word| word.as_bytes()).collect();
     let mut out = Vec::with_capacity(data.len());
     let mut small: Vec<u8> = Vec::new();
@@ -138,5 +243,5 @@ pub fn inverse(text: Vec<u8>) -> Vec<u8> {
             }
         }
     }
-    out
+    wrap(&out)
 }
