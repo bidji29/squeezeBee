@@ -27,10 +27,21 @@ const ONE: i32 = 1 << 16;
 /// The error (out of 2^16) times the input (steps of 1/256) is shifted down by this much before it moves a weight.
 const RATE: u32 = 13;
 
+/// The rate starts high and falls as a weight set learns: an update moves its weights by `FAST / (count + 1)`
+/// times the base rate, the count being how many updates that set (that one context of its chooser) has had,
+/// and never by less than `LEAST` times it, a least rate below the base one that keeps adapting. Both are in
+/// sixteenths.
+const FAST: i64 = 16 * 12;
+const LEAST: i64 = 6;
+/// The count stops here: past it the rate is the least one for good.
+const CAP: u16 = 1023;
+
 pub struct Mixer {
     inputs: usize,
     /// All the weights: for each set, for each of its contexts, one weight per input.
     weights: Vec<i32>,
+    /// For each set, for each of its contexts, how many updates its weights have had.
+    counts: Vec<u16>,
     /// Where each set's contexts start in `weights`.
     bases: [usize; SETS],
     /// The inputs of the bit being coded.
@@ -45,13 +56,16 @@ impl Mixer {
     pub fn new(inputs: usize) -> Self {
         let mut bases = [0; SETS];
         let mut total = 0;
+        let mut slots = 0;
         for set in 0..SETS {
+            slots += SIZES[set];
             bases[set] = total;
             total += SIZES[set] * inputs;
         }
         Mixer {
             inputs,
             weights: vec![ONE / inputs.max(1) as i32; total],
+            counts: vec![0; slots],
             bases,
             seen: vec![0; inputs],
             chosen: [0; SETS],
@@ -93,8 +107,14 @@ impl Mixer {
         for set in 0..SETS {
             let error = ((bit << 16) as i32) - cx.scale.squash_fine(self.said[set]) as i32;
             let at = self.chosen[set];
+            let slot = if n == 0 { 0 } else { at / n };
+            let count = self.counts[slot];
+            if count < CAP {
+                self.counts[slot] = count + 1;
+            }
+            let speed = (FAST / (count as i64 + 1)).max(LEAST);
             for (w, x) in self.weights[at..at + n].iter_mut().zip(self.seen.iter()) {
-                *w += (*x * error) >> RATE;
+                *w += ((*x as i64 * error as i64 * speed) >> (RATE + 4)) as i32;
             }
         }
     }
