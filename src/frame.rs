@@ -196,49 +196,66 @@ fn costs() -> Vec<u32> {
     table
 }
 
-/// The first pass: the choice of weights that would have coded this text in the fewest bits.
-fn measure(text: &[u8]) -> usize {
-    let costs = costs();
-    let mut spent = [0u64; CHOICES];
-    let mut predictor = Predictor::new(0);
-    for (at, &byte) in text.iter().enumerate() {
-        for shift in (0..8).rev() {
-            let bit = ((byte >> shift) & 1) as u32;
-            predictor.predict(&text[..at]);
-            for (choice, sum) in spent.iter_mut().enumerate() {
-                let p = predictor.weigh(choice);
-                *sum += costs[if bit == 1 { p } else { 65536 - p } as usize] as u64;
-            }
-            predictor.update(bit);
-        }
-    }
-    let mut best = 0;
-    for choice in 1..CHOICES {
-        if spent[choice] < spent[best] {
-            best = choice;
-        }
-    }
-    best
+/// What one pass over the text does with each bit: count what every choice would cost (the first pass), code
+/// it, or read it back.
+enum Way<'a> {
+    Measure(Vec<u32>, [u64; CHOICES]),
+    Encode(Encoder),
+    Decode(Decoder<'a>),
 }
 
-/// The message for the data.
+/// One pass over `size` bytes, bit by bit, in the same order for every way: the one loop the three passes share.
+/// The text is read from `text`, or, when decoding (`text` is then empty), read back into `back`.
+fn pass(text: &[u8], back: &mut Vec<u8>, size: usize, choice: usize, way: &mut Way) {
+    let mut predictor = Predictor::new(choice);
+    for at in 0..size {
+        let known = if text.is_empty() { 0 } else { text[at] as u32 };
+        let mut byte = 0;
+        for shift in (0..8).rev() {
+            let p = predictor.predict(if text.is_empty() { back } else { &text[..at] });
+            let mut bit = (known >> shift) & 1;
+            match way {
+                Way::Measure(costs, spent) => {
+                    for (choice, sum) in spent.iter_mut().enumerate() {
+                        let p = predictor.weigh(choice);
+                        *sum += costs[if bit == 1 { p } else { 65536 - p } as usize] as u64;
+                    }
+                }
+                Way::Encode(coder) => coder.code(bit, p),
+                Way::Decode(coder) => bit = coder.decode(p),
+            }
+            predictor.update(bit);
+            byte = (byte << 1) | bit;
+        }
+        if text.is_empty() {
+            back.push(byte as u8);
+        }
+    }
+}
+
+/// The message for the data. The first pass reads the start of the text and keeps the choice of weights that
+/// would have coded it in the fewest bits.
 pub fn encode(data: &[u8]) -> Vec<u8> {
     let text = transform::forward(data);
-    let choice = measure(&text[..text.len() / SHARE]);
+    let mut way = Way::Measure(costs(), [0; CHOICES]);
+    pass(&text, &mut Vec::new(), text.len() / SHARE, 0, &mut way);
+    let mut choice = 0;
+    if let Way::Measure(_, spent) = way {
+        for at in 1..CHOICES {
+            if spent[at] < spent[choice] {
+                choice = at;
+            }
+        }
+    }
     let mut out = Vec::with_capacity(text.len() / 2 + 64);
     out.extend_from_slice(&(text.len() as u32).to_le_bytes());
     out.push(choice as u8);
-    let mut coder = Encoder::new(out);
-    let mut predictor = Predictor::new(choice);
-    for (at, &byte) in text.iter().enumerate() {
-        for shift in (0..8).rev() {
-            let bit = ((byte >> shift) & 1) as u32;
-            let p = predictor.predict(&text[..at]);
-            coder.code(bit, p);
-            predictor.update(bit);
-        }
+    let mut way = Way::Encode(Encoder::new(out));
+    pass(&text, &mut Vec::new(), text.len(), choice, &mut way);
+    match way {
+        Way::Encode(coder) => coder.finish(),
+        _ => Vec::new(),
     }
-    coder.finish()
 }
 
 /// The data, from its message.
@@ -248,17 +265,7 @@ pub fn decode(message: &[u8]) -> Vec<u8> {
     }
     let size = u32::from_le_bytes([message[0], message[1], message[2], message[3]]) as usize;
     let mut text = Vec::with_capacity(size);
-    let mut coder = Decoder::new(&message[5..]);
-    let mut predictor = Predictor::new(message[4] as usize % CHOICES);
-    for _ in 0..size {
-        let mut byte = 0;
-        for _ in 0..8 {
-            let p = predictor.predict(&text);
-            let bit = coder.decode(p);
-            predictor.update(bit);
-            byte = (byte << 1) | bit;
-        }
-        text.push(byte as u8);
-    }
+    let mut way = Way::Decode(Decoder::new(&message[5..]));
+    pass(&[], &mut text, size, message[4] as usize % CHOICES, &mut way);
     transform::inverse(text)
 }
