@@ -1,14 +1,19 @@
 //! The frame: what a message is, and the loop that codes the data one bit at a time.
 //!
-//! A message is the length of the transformed text (four bytes, the low one first), one byte that says which
-//! weights the last step works with, then the arithmetic coder's bytes. For each bit, in the same order when encoding and when decoding: every model predicts, the mixer makes
-//! one prediction of theirs, the refining step has a last look, the coder codes the bit with that probability, and
-//! all of them are told the bit. The coder's probability is out of 65536, and learnt (see STEP).
+//! A message is the length of the transformed text (four bytes, the low one first), PARTS bytes that say which
+//! weights the last step works with in each part of the text, the length of each part's coded bytes but the last
+//! (four bytes each, the low one first), then each part's arithmetic coder's bytes, one after the other. For each
+//! bit, in the same order when encoding and when decoding: every model predicts, the mixer makes one prediction of
+//! theirs, the refining step has a last look, the coder codes the bit with that probability, and all of them are
+//! told the bit. The coder's probability is out of 65536, and learnt (see STEP).
 //!
 //! The frame's last step adds two corrections to what it learnt: the refining step's, and its own, from the six
-//! bytes before (see DEEP_BITS). How much each one counts is not written here: the encoder takes two passes. It
-//! first codes the start of the text for nobody, counting what every pair of weights of a small grid would have
-//! cost, and then codes the whole text with the cheapest pair, whose number is the fifth byte of the message.
+//! bytes before (see DEEP_BITS). How much each one counts is not written here, and it may differ from one part of
+//! the text to the next (the text mixes plays and verse with prose): the text is cut in PARTS parts at fixed places,
+//! and each part is coded by a coder of its own. What the models learn does not depend on the weights, so the
+//! encoder reads the text once and codes each part with every pair of weights of a small grid at once, then keeps,
+//! for each part, the pair whose bytes are fewest; its number is that part's byte of the message. The models carry
+//! on from one part to the next: only the coder starts again.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -43,11 +48,16 @@ const DEEP_CUTS: usize = (4096 >> DEEP_STEP) + 1;
 /// A cut that has seen n bits moves 1 / (n + 1.5) of the way, times its share of the line, until n is DEEP_LIMIT.
 const DEEP_LIMIT: u32 = 255;
 
-/// The pairs of weights the first pass tries: CHOICES of them, four weights for each correction.
+/// The pairs of weights a part may choose from: CHOICES of them, four weights for each correction.
 const CHOICES: usize = 16;
 
-/// The first pass reads one byte in SHARE of the text, from its start.
-const SHARE: usize = 4;
+/// The text is cut in PARTS parts of (nearly) the same length; each one chooses its pair of weights by itself.
+const PARTS: usize = 8;
+
+/// Where part `k` of a text of `size` bytes starts.
+fn part_start(size: usize, k: usize) -> usize {
+    (size as u64 * k as u64 / PARTS as u64) as usize
+}
 
 /// The weights of a choice: the refining step's correction (steps of 1/4096) counts for the first, the frame's
 /// own (steps of 1/65536) for the second, in sixteenths.
@@ -171,94 +181,81 @@ fn cx_six(cx: &Context) -> u64 {
     cx.last8 & 0xFFFF_FFFF_FFFF
 }
 
-/// What a bit costs, in 2^-16 of a bit, when it was given the probability p out of 65536 (index p; 0 is not
-/// asked): the logarithm, with the four operations alone, a binary digit at each squaring.
-fn costs() -> Vec<u32> {
-    let mut table = vec![0u32; 65536];
-    for (p, slot) in table.iter_mut().enumerate().skip(1) {
-        let mut x = p as f64;
-        let mut cost = 0u32;
-        while x < 32768.0 {
-            x *= 2.0;
-            cost += 1 << 16;
-        }
-        x /= 32768.0;
-        cost += 1 << 16;
-        for digit in (0..16).rev() {
-            x *= x;
-            if x >= 2.0 {
-                x /= 2.0;
-                cost -= 1 << digit;
-            }
-        }
-        *slot = cost;
-    }
-    table
-}
-
-/// The first pass: the choice of weights that would have coded this text in the fewest bits.
-fn measure(text: &[u8]) -> usize {
-    let costs = costs();
-    let mut spent = [0u64; CHOICES];
-    let mut predictor = Predictor::new(0);
-    for (at, &byte) in text.iter().enumerate() {
-        for shift in (0..8).rev() {
-            let bit = ((byte >> shift) & 1) as u32;
-            predictor.predict(&text[..at]);
-            for (choice, sum) in spent.iter_mut().enumerate() {
-                let p = predictor.weigh(choice);
-                *sum += costs[if bit == 1 { p } else { 65536 - p } as usize] as u64;
-            }
-            predictor.update(bit);
-        }
-    }
-    let mut best = 0;
-    for choice in 1..CHOICES {
-        if spent[choice] < spent[best] {
-            best = choice;
-        }
-    }
-    best
-}
-
 /// The message for the data.
 pub fn encode(data: &[u8]) -> Vec<u8> {
     let text = transform::forward(data);
-    let choice = measure(&text[..text.len() / SHARE]);
+    let mut choices = [0u8; PARTS];
+    let mut streams: Vec<Vec<u8>> = Vec::with_capacity(PARTS);
+    let mut predictor = Predictor::new(0);
+    for (k, choice) in choices.iter_mut().enumerate() {
+        let (start, end) = (part_start(text.len(), k), part_start(text.len(), k + 1));
+        let mut coders: Vec<Encoder> =
+            (0..CHOICES).map(|_| Encoder::new(Vec::with_capacity((end - start) / 2 + 16))).collect();
+        for at in start..end {
+            let byte = text[at];
+            for shift in (0..8).rev() {
+                let bit = ((byte >> shift) & 1) as u32;
+                predictor.predict(&text[..at]);
+                for (c, coder) in coders.iter_mut().enumerate() {
+                    coder.code(bit, predictor.weigh(c));
+                }
+                predictor.update(bit);
+            }
+        }
+        let mut best: Option<Vec<u8>> = None;
+        for (c, coder) in coders.into_iter().enumerate() {
+            let bytes = coder.finish();
+            if best.as_ref().map_or(true, |b| bytes.len() < b.len()) {
+                *choice = c as u8;
+                best = Some(bytes);
+            }
+        }
+        streams.push(best.unwrap_or_default());
+    }
     let mut out = Vec::with_capacity(text.len() / 2 + 64);
     out.extend_from_slice(&(text.len() as u32).to_le_bytes());
-    out.push(choice as u8);
-    let mut coder = Encoder::new(out);
-    let mut predictor = Predictor::new(choice);
-    for (at, &byte) in text.iter().enumerate() {
-        for shift in (0..8).rev() {
-            let bit = ((byte >> shift) & 1) as u32;
-            let p = predictor.predict(&text[..at]);
-            coder.code(bit, p);
-            predictor.update(bit);
-        }
+    out.extend_from_slice(&choices);
+    for stream in &streams[..PARTS - 1] {
+        out.extend_from_slice(&(stream.len() as u32).to_le_bytes());
     }
-    coder.finish()
+    for stream in &streams {
+        out.extend_from_slice(stream);
+    }
+    out
 }
 
 /// The data, from its message.
 pub fn decode(message: &[u8]) -> Vec<u8> {
-    if message.len() < 5 {
+    let head = 4 + PARTS + 4 * (PARTS - 1);
+    if message.len() < head {
         return Vec::new();
     }
     let size = u32::from_le_bytes([message[0], message[1], message[2], message[3]]) as usize;
+    let choices = &message[4..4 + PARTS];
     let mut text = Vec::with_capacity(size);
-    let mut coder = Decoder::new(&message[5..]);
-    let mut predictor = Predictor::new(message[4] as usize % CHOICES);
-    for _ in 0..size {
-        let mut byte = 0;
-        for _ in 0..8 {
-            let p = predictor.predict(&text);
-            let bit = coder.decode(p);
-            predictor.update(bit);
-            byte = (byte << 1) | bit;
+    let mut predictor = Predictor::new(0);
+    let mut from = head;
+    for k in 0..PARTS {
+        let to = if k + 1 < PARTS {
+            let at = 4 + PARTS + 4 * k;
+            let len = u32::from_le_bytes([message[at], message[at + 1], message[at + 2], message[at + 3]]) as usize;
+            (from + len).min(message.len())
+        } else {
+            message.len()
+        };
+        let mut coder = Decoder::new(&message[from.min(to)..to]);
+        predictor.choice = choices[k] as usize % CHOICES;
+        for _ in part_start(size, k)..part_start(size, k + 1) {
+            let mut byte = 0;
+            for _ in 0..8 {
+                let p = predictor.predict(&text);
+                let bit = coder.decode(p);
+                predictor.update(bit);
+                byte = (byte << 1) | bit;
+            }
+            text.push(byte as u8);
         }
-        text.push(byte as u8);
+        from = to;
     }
     transform::inverse(text)
 }
