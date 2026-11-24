@@ -9,7 +9,7 @@
 //! - the most frequent words are written as one byte each, from 128 up, after their marker if they have one.
 //! A byte of the data that would be taken for one of these (1 to 8, or 128 and more) is written after ESC.
 //!
-//! Before those, the line breaks of wrapped prose are written as spaces (see `unwrap`), so that the models see
+//! Before those, the line breaks of wrapped prose are written as spaces (see `walk`), so that the models see
 //! the words of a paragraph run on as they do inside a line.
 
 use alloc::borrow::Cow;
@@ -34,8 +34,10 @@ const WORDS: &str = "\
     into if we no though man other house without say scene night heart better mr therefore who do take \
     down something hath speak made hand might micawber friend lady let";
 
-fn is_letter(b: u8) -> bool {
-    b.is_ascii_alphabetic()
+/// One byte more at the end of `out` (written once, called from everywhere: the program is counted too).
+#[inline(never)]
+fn put(out: &mut Vec<u8>, b: u8) {
+    out.push(b);
 }
 
 /// The width prose is wrapped at, in characters: a line break is put back where the next word would not fit.
@@ -49,199 +51,174 @@ fn starts_char(b: u8) -> bool {
     b & 0xC0 != 0x80
 }
 
-/// The rule: at a space or a line break, after a line of `line` characters, with a word of `word` characters
-/// next, the line breaks there if the word does not fit.
-fn breaks(line: usize, word: usize) -> bool {
-    word >= 1 && line + 1 + word > WIDTH
-}
-
-/// The data with each line break that the rule gives written as a space, and each space that the rule would take
-/// for a line break written after KEEP (and KEEP itself after KEEP): `wrap` puts them back exactly.
-fn unwrap(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() + 16);
-    let mut line = 0;
-    for (i, &b) in data.iter().enumerate() {
-        if b == b' ' || b == b'\n' {
-            let mut word = 0;
-            let mut j = i + 1;
-            while j < data.len() && data[j] != b' ' && data[j] != b'\n' {
-                if starts_char(data[j]) {
-                    word += 1;
-                }
-                j += 1;
-            }
-            let rule = breaks(line, word);
-            if b == b'\n' {
-                out.push(if rule { b' ' } else { b'\n' });
-                line = 0;
-            } else {
-                if rule {
-                    out.push(KEEP);
-                }
-                out.push(b' ');
-                line += 1;
-            }
-        } else {
-            if b == KEEP {
-                out.push(KEEP);
-            }
-            out.push(b);
-            if starts_char(b) {
-                line += 1;
-            }
+/// The entry of WORDS that is `key`, or else the `n`th: its number and its letters (none past the last entry).
+#[inline(never)]
+fn lookup(key: &[u8], n: usize) -> (usize, &'static [u8]) {
+    for (k, word) in WORDS.as_bytes().split(|&c| c == b' ').enumerate() {
+        if word == key || k == n {
+            return (k, word);
         }
     }
-    out
+    (0, &[])
 }
 
-/// The data, from what `unwrap` made of it.
-fn wrap(text: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len() + text.len() / 64);
+/// How many characters the word at `j` holds, up to the next space or line break. In the text `walk` wraps
+/// (`keep`), KEEP before a space ends the word, and KEEP before another byte stands for that byte.
+fn ahead(t: &[u8], mut j: usize, keep: bool) -> usize {
+    let mut word = 0;
+    // KEEP, or a value no byte has.
+    let mark = if keep { KEEP as u32 } else { 256 };
+    while j < t.len() && t[j] != b' ' && t[j] != b'\n' {
+        if t[j] as u32 == mark {
+            j += 1;
+            if j >= t.len() || t[j] == b' ' {
+                break;
+            }
+        }
+        if starts_char(t[j]) {
+            word += 1;
+        }
+        j += 1;
+    }
+    word
+}
+
+/// One walk for both ways. Unwrapping (`back` false): each line break that the rule gives is written as a space,
+/// and each space that the rule would take for a line break is written after KEEP (and KEEP itself after KEEP).
+/// Wrapping (`back` true) puts them back exactly. The rule: at a space or a line break, after a line of `line`
+/// characters, the line breaks there if the next word does not fit.
+fn walk(t: &[u8], back: bool) -> Vec<u8> {
+    let mut out = Vec::new();
     let mut line = 0;
     let mut i = 0;
-    while i < text.len() {
-        let mut b = text[i];
+    while let Some(&c) = t.get(i) {
+        let mut b = c;
         i += 1;
-        if b == KEEP {
-            if i < text.len() {
-                b = text[i];
-                i += 1;
-            }
-        } else if b == b' ' {
-            let mut word = 0;
-            let mut j = i;
-            while j < text.len() && text[j] != b' ' && text[j] != b'\n' {
-                if text[j] == KEEP {
-                    if j + 1 < text.len() && text[j + 1] == b' ' {
-                        break;
-                    }
-                    j += 1;
-                    if j < text.len() && starts_char(text[j]) {
-                        word += 1;
-                    }
-                } else if starts_char(text[j]) {
-                    word += 1;
+        // The data's own byte, whichever way.
+        let mut d = b;
+        if b == b' ' || (b == b'\n' && !back) {
+            let word = ahead(t, i, back);
+            let rule = word >= 1 && line + 1 + word > WIDTH;
+            if back {
+                if rule {
+                    d = b'\n';
+                    b = d;
                 }
-                j += 1;
+            } else if b == b'\n' {
+                if rule {
+                    b = b' ';
+                }
+            } else if rule {
+                put(&mut out, KEEP);
             }
-            if breaks(line, word) {
-                b = b'\n';
+        } else if b == KEEP {
+            if back {
+                if i < t.len() {
+                    d = t[i];
+                    b = d;
+                    i += 1;
+                }
+            } else {
+                put(&mut out, KEEP);
             }
         }
-        out.push(b);
-        if b == b'\n' {
-            line = 0;
-        } else if starts_char(b) {
-            line += 1;
-        }
+        put(&mut out, b);
+        line = if d == b'\n' { 0 } else { line + starts_char(d) as usize };
     }
     out
 }
 
 /// The text the models are given for the data.
 pub fn forward(data: &[u8]) -> Cow<'_, [u8]> {
-    let unwrapped = unwrap(data);
-    let data = &unwrapped[..];
-    let words: Vec<&[u8]> = WORDS.split(' ').map(|word| word.as_bytes()).collect();
-    let mut out = Vec::with_capacity(data.len());
-    let mut small: Vec<u8> = Vec::new();
+    let data = walk(data, false);
+    let mut out = Vec::new();
     let mut i = 0;
     while i < data.len() {
         let b = data[i];
-        if is_letter(b) {
-            let mut j = i;
-            let mut capitals = 0;
-            while j < data.len() && is_letter(data[j]) {
-                if data[j].is_ascii_uppercase() {
-                    capitals += 1;
-                }
-                j += 1;
+        let mut j = i;
+        let mut capitals = 0;
+        while j < data.len() && data[j].is_ascii_alphabetic() {
+            capitals += data[j].is_ascii_uppercase() as usize;
+            j += 1;
+        }
+        if j > i {
+            // UP before a word all of capitals, else CAP before each capital; then the small letters, which
+            // the word's byte replaces if the word is one of WORDS and the markers are none, CAP first, or UP.
+            let up = capitals >= 2 && capitals == j - i;
+            // (A letter is a capital if it is below 'a'; the first is one only if `capitals` counts it.)
+            let whole = up || capitals == (b < b'a') as usize;
+            if up {
+                put(&mut out, UP);
             }
-            let word = &data[i..j];
-            let marker = if capitals == 0 {
-                0
-            } else if capitals == word.len() && capitals >= 2 {
-                UP
-            } else if capitals == 1 && word[0].is_ascii_uppercase() {
-                CAP
-            } else {
-                for &c in word {
-                    if c.is_ascii_uppercase() {
-                        out.push(CAP);
-                    }
-                    out.push(c.to_ascii_lowercase());
+            let start = out.len() + (capitals == 1) as usize;
+            // A letter is a capital if it is below 'a'; under UP, none takes CAP.
+            let below = if up { 0 } else { b'a' };
+            for &c in &data[i..j] {
+                if c < below {
+                    put(&mut out, CAP);
                 }
-                i = j;
-                continue;
-            };
-            if marker != 0 {
-                out.push(marker);
+                put(&mut out, c | 32);
             }
-            small.clear();
-            small.extend(word.iter().map(|c| c.to_ascii_lowercase()));
-            match words.iter().position(|entry| *entry == &small[..]) {
-                Some(found) => out.push(FIRST_WORD + found as u8),
-                None => out.extend_from_slice(&small),
+            if whole {
+                let (k, word) = lookup(&out[start..], usize::MAX);
+                if !word.is_empty() {
+                    out.truncate(start);
+                    put(&mut out, FIRST_WORD + k as u8);
+                }
             }
             i = j;
-        } else if b == 0xE2 && i + 2 < data.len() && data[i + 1] == 0x80 && MARKS.contains(&data[i + 2]) {
-            let which = MARKS.iter().position(|&m| m == data[i + 2]).unwrap_or(0);
-            out.push(FIRST_MARK + which as u8);
-            i += 3;
-        } else {
-            if (b >= ESC && b < FIRST_MARK + MARKS.len() as u8) || b >= FIRST_WORD {
-                out.push(ESC);
-            }
-            out.push(b);
-            i += 1;
+            continue;
         }
+        i += 1;
+        if let (0xE2, Some(&[0x80, m])) = (b, data.get(i..i + 2)) {
+            if let Some(k) = MARKS.iter().position(|&x| x == m) {
+                put(&mut out, FIRST_MARK + k as u8);
+                i += 2;
+                continue;
+            }
+        }
+        if (ESC..FIRST_MARK + MARKS.len() as u8).contains(&b) || b >= FIRST_WORD {
+            put(&mut out, ESC);
+        }
+        put(&mut out, b);
     }
     Cow::Owned(out)
 }
 
 /// The data, from the text `forward` made of it.
 pub fn inverse(text: Vec<u8>) -> Vec<u8> {
-    let words: Vec<&[u8]> = WORDS.split(' ').map(|word| word.as_bytes()).collect();
-    let mut out = Vec::with_capacity(text.len() + text.len() / 2);
-    // The marker that waits for its letters: 0, CAP or UP.
+    let mut out = Vec::new();
+    // The marker that waits for its letters: 0, CAP (for one letter) or UP (for the word's).
     let mut marker = 0;
     let mut i = 0;
-    while i < text.len() {
-        let b = text[i];
+    while let Some(&b) = text.get(i) {
         i += 1;
-        if b >= FIRST_WORD {
-            let word = match words.get((b - FIRST_WORD) as usize) {
-                Some(word) => *word,
-                None => &[],
-            };
-            for (at, &c) in word.iter().enumerate() {
-                out.push(if marker == UP || (marker == CAP && at == 0) { c.to_ascii_uppercase() } else { c });
-            }
-            marker = 0;
-        } else if b.is_ascii_lowercase() {
-            if marker == 0 {
-                out.push(b);
-            } else {
-                out.push(b.to_ascii_uppercase());
+        let one = [b];
+        let word = if b >= FIRST_WORD { lookup(&[], (b - FIRST_WORD) as usize).1 } else { &one[..] };
+        if b >= FIRST_WORD || b.is_ascii_lowercase() {
+            for &c in word {
+                put(&mut out, if marker != 0 { c ^ 32 } else { c });
                 if marker == CAP {
                     marker = 0;
                 }
             }
-        } else {
-            marker = 0;
-            if b == ESC {
-                if i < text.len() {
-                    out.push(text[i]);
-                    i += 1;
-                }
-            } else if b == CAP || b == UP {
-                marker = b;
-            } else if b >= FIRST_MARK && b < FIRST_MARK + MARKS.len() as u8 {
-                out.extend_from_slice(&[0xE2, 0x80, MARKS[(b - FIRST_MARK) as usize]]);
-            } else {
-                out.push(b);
+            continue;
+        }
+        marker = 0;
+        if b == ESC {
+            if let Some(&c) = text.get(i) {
+                put(&mut out, c);
             }
+            i += 1;
+        } else if b == CAP || b == UP {
+            marker = b;
+        } else if (FIRST_MARK..FIRST_MARK + MARKS.len() as u8).contains(&b) {
+            for c in [0xE2, 0x80, MARKS[(b - FIRST_MARK) as usize]] {
+                put(&mut out, c);
+            }
+        } else {
+            put(&mut out, b);
         }
     }
-    wrap(&out)
+    walk(&out, true)
 }
