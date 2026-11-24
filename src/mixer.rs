@@ -36,12 +36,28 @@ const LEAST: i64 = 6;
 /// The count stops here: past it the rate is the least one for good.
 const CAP: u16 = 1023;
 
+/// Each weight set also keeps two running averages of how wrong its predictions were (the size of its error, out
+/// of 2^16): a recent one, each new error counting for 1 / 2^`TRACK` of it, and a long one (1 / 2^`LONG`). The rate
+/// is scaled by the recent one over the long one: faster while the set is wrong more often than it usually is,
+/// slower while it is right, and never by less than `SLOWEST` nor more than `FASTEST` sixteenths. Both start at
+/// `USUAL`.
+const TRACK: u32 = 4;
+/// The long average, each error counting for 1 / 2^`LONG` of it, against which the recent one is weighed.
+const LONG: u32 = 8;
+const USUAL: i64 = 1 << 14;
+const SLOWEST: i64 = 8;
+const FASTEST: i64 = 32;
+
 pub struct Mixer {
     inputs: usize,
     /// All the weights: for each set, for each of its contexts, one weight per input.
     weights: Vec<i32>,
     /// For each set, for each of its contexts, how many updates its weights have had.
     counts: Vec<u16>,
+    /// For each set, for each of its contexts, the running average of the size of its error.
+    wrong: Vec<u16>,
+    /// The same average taken over a long while: what this set's error usually is.
+    usual: Vec<u16>,
     /// Where each set's contexts start in `weights`.
     bases: [usize; SETS],
     /// The inputs of the bit being coded.
@@ -66,6 +82,8 @@ impl Mixer {
             inputs,
             weights: vec![ONE / inputs.max(1) as i32; total],
             counts: vec![0; slots],
+            wrong: vec![USUAL as u16; slots],
+            usual: vec![USUAL as u16; slots],
             bases,
             seen: vec![0; inputs],
             chosen: [0; SETS],
@@ -112,7 +130,13 @@ impl Mixer {
             if count < CAP {
                 self.counts[slot] = count + 1;
             }
-            let speed = (FAST / (count as i64 + 1)).max(LEAST);
+            let average = self.wrong[slot] as i32;
+            let usual = self.usual[slot] as i32;
+            let size = error.abs().min(0xFFFF);
+            self.wrong[slot] = (average + ((size - average) >> TRACK)) as u16;
+            self.usual[slot] = (usual + ((size - usual) >> LONG)) as u16;
+            let scale = (average as i64 * 16 / (usual as i64).max(64)).clamp(SLOWEST, FASTEST);
+            let speed = (FAST / (count as i64 + 1)).max(LEAST) * scale / 16;
             for (w, x) in self.weights[at..at + n].iter_mut().zip(self.seen.iter()) {
                 *w += ((*x as i64 * error as i64 * speed) >> (RATE + 4)) as i32;
             }
