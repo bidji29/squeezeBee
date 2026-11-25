@@ -16,10 +16,14 @@ use alloc::vec::Vec;
 use crate::context::Context;
 
 /// How many sets of weights are chosen at each bit, each by its own context.
-const SETS: usize = 3;
+const SETS: usize = 4;
 
-/// How many contexts each chooser tells apart.
-const SIZES: [usize; SETS] = [256 * 256; SETS];
+/// How many contexts each chooser tells apart: a whole byte with the bits known so far, for the first three;
+/// a coarse class of the previous byte with those bits, for the last.
+const SIZES: [usize; SETS] = [256 * 256, 256 * 256, 256 * 256, CLASSES * 256];
+
+/// How many coarse classes of a byte the last chooser tells apart (see `class`).
+const CLASSES: usize = 8;
 
 /// A weight of 1 is 2^16.
 const ONE: i32 = 1 << 16;
@@ -73,12 +77,33 @@ impl Mixer {
         }
     }
 
-    /// The context each set of weights is chosen by: one of the last three whole bytes, and the bits of the
-    /// current byte known so far (which also give the bit's place).
+    /// A coarse class of a byte: a line break, a space (or another control byte), a lower-case letter, a
+    /// capital, a digit, a punctuation mark, a byte of 128 or more, or a bracket or symbol. Each class holds
+    /// many bytes, so the set it chooses sees many updates.
+    fn class(b: usize) -> usize {
+        match b as u8 {
+            b'\n' | b'\r' => 0,
+            b'a'..=b'z' => 2,
+            b'A'..=b'Z' => 3,
+            b'0'..=b'9' => 4,
+            b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' | b'"' => 5,
+            0..=0x20 | 0x7F => 1,
+            0x80..=0xFF => 6,
+            _ => 7,
+        }
+    }
+
+    /// The context each set of weights is chosen by: one of the last three whole bytes, or the coarse class
+    /// of the previous one, and the bits of the current byte known so far (which also give the bit's place).
     fn choose(cx: &Context) -> [usize; SETS] {
         let partial = cx.partial as usize;
         let byte = |back: u32| ((cx.last4 >> (8 * back)) & 0xFF) as usize;
-        [(byte(2) << 8) | partial, (byte(0) << 8) | partial, (byte(1) << 8) | partial]
+        [
+            (byte(2) << 8) | partial,
+            (byte(0) << 8) | partial,
+            (byte(1) << 8) | partial,
+            (Self::class(byte(0)) << 8) | partial,
+        ]
     }
 
     /// One stretched prediction from the models' stretched predictions.
