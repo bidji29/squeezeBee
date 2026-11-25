@@ -1,7 +1,7 @@
 //! What every part of the program is told about where the coding stands: the bytes just before, the bits of the
 //! byte being coded, and the logistic scale they all share.
 
-use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::logistic::Scale;
 use crate::transform;
@@ -45,13 +45,22 @@ pub struct Context {
 
 impl Context {
     pub fn new() -> Self {
-        // A byte from 128 up is a word: the transform says how long. The markers below 4 show nothing.
+        // A byte from 128 up is a word: the transform says how long, all of them in one call, each word after a 0
+        // that it leaves as it is. The markers below 4 show nothing, every other byte one character.
         let mut widths = [1u8; 256];
-        for (byte, width) in widths.iter_mut().enumerate() {
-            if byte < 4 {
-                *width = 0;
-            } else if byte >= 128 {
-                *width = transform::inverse(vec![byte as u8]).len() as u8;
+        widths[..4].fill(0);
+        let mut words = Vec::new();
+        for word in 128..=255 {
+            words.push(0);
+            words.push(word);
+        }
+        let mut byte = 127;
+        for &c in transform::inverse(words).iter() {
+            if c == 0 {
+                byte += 1;
+                widths[byte & 255] = 0;
+            } else {
+                widths[byte & 255] += 1;
             }
         }
         Context {
@@ -80,10 +89,11 @@ impl Context {
         self.bit += 1;
         if self.bit == 8 {
             let byte = self.partial & 0xFF;
-            self.last4 = (self.last4 << 8) | byte;
             self.last8 = (self.last8 << 8) | byte as u64;
-            self.word = if is_word(byte) { (self.word + byte + 1).wrapping_mul(0x2F0B_4A8D) } else { 0 };
-            if is_word(byte) || byte >= 128 {
+            self.last4 = self.last8 as u32;
+            let letter = is_word(byte);
+            self.word = if letter { (self.word + byte + 1).wrapping_mul(0x2F0B_4A8D) } else { 0 };
+            if letter || byte >= 128 {
                 self.whole = (self.whole + byte + 1).wrapping_mul(0x2F0B_4A8D);
             } else if self.whole != 0 {
                 self.before2 = self.before;
