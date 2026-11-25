@@ -19,8 +19,8 @@
 //! The history is the one the frame gives to `predict` (the whole bytes coded so far): the model keeps the
 //! index and no second copy of the bytes.
 
+use alloc::boxed::Box;
 use alloc::vec;
-use alloc::vec::Vec;
 
 use crate::context::Context;
 
@@ -49,14 +49,17 @@ const SIDE_BITS: u32 = 16;
 const VIEWS: usize = 4;
 const WEIGHTY: usize = 12;
 
+/// Where a count starts, out of 65536. A table holds each count XOR START, so that it starts at 0.
+const START: u16 = 49152;
+
 pub struct Model {
     /// For each hash, the last two places: the most recent first.
-    index: Vec<u32>,
+    index: Box<[u32; 2 << BITS]>,
     /// How often the foretold bit came true, out of 65536: for each view of the other match, for each class of
     /// length, for each bit of a byte.
-    sure: Vec<u16>,
+    sure: Box<[u16; VIEWS * CLASSES * 8]>,
     /// The same, chosen by the foretold byte, the byte before and the bit.
-    side: Vec<u16>,
+    side: Box<[u16; 1 << SIDE_BITS]>,
     /// The two matches held: the place in the history of the byte each foretells, and its length (0: none).
     place: [usize; 2],
     length: [usize; 2],
@@ -83,12 +86,20 @@ fn class(length: usize) -> usize {
     }
 }
 
+/// A table of N counts, each `value`, on the heap.
+fn table<T: Clone, const N: usize>(value: T) -> Box<[T; N]> {
+    match vec![value; N].into_boxed_slice().try_into() {
+        Ok(table) => table,
+        Err(_) => loop {},
+    }
+}
+
 impl Model {
     pub fn new() -> Self {
         Model {
-            index: vec![0; 2 << BITS],
-            sure: vec![49152; VIEWS * CLASSES * 8],
-            side: vec![49152; 1 << SIDE_BITS],
+            index: table(0),
+            sure: table(0),
+            side: table(0),
             place: [0; 2],
             length: [0; 2],
             longer: 0,
@@ -105,7 +116,7 @@ impl Model {
         let n = history.len();
         for m in 0..2 {
             if self.length[m] > 0 {
-                if history[self.place[m]] == history[n - 1] {
+                if history.get(self.place[m]) == Some(&(cx.last4 as u8)) {
                     self.place[m] += 1;
                     if self.length[m] < REACH {
                         self.length[m] += 1;
@@ -125,7 +136,7 @@ impl Model {
                         continue;
                     }
                     let mut length = 0;
-                    while length < REACH && length < found && history[found - 1 - length] == history[n - 1 - length] {
+                    while length < REACH && length < found && history.get(found - 1 - length) == history.get(n - 1 - length) {
                         length += 1;
                     }
                     if length >= SEED {
@@ -138,12 +149,11 @@ impl Model {
             self.index[slot] = n as u32;
         }
         // The longer of the two; of two as long, the one at the more recent place.
-        let long = if self.length[1] > self.length[0] || (self.length[1] == self.length[0] && self.place[1] > self.place[0]) {
-            1
-        } else {
-            0
+        let long = ((self.length[1], self.place[1]) > (self.length[0], self.place[0])) as usize;
+        let byte = |m: usize| match history.get(self.place[m]) {
+            Some(&b) if self.length[m] > 0 => b as u32 | 256,
+            _ => 0,
         };
-        let byte = |m: usize| if self.length[m] > 0 { history[self.place[m]] as u32 | 256 } else { 0 };
         self.longer = self.length[long];
         self.foretold = byte(long);
         let other = byte(1 - long);
@@ -163,25 +173,21 @@ impl Model {
             self.step(cx, history);
         }
         let bit = cx.bit;
+        out[1] = 0;
+        out[0] = 0;
+        self.expected = 2;
         if self.foretold >> (8 - bit) != cx.partial {
-            self.expected = 2;
-            out[0] = 0;
-            out[1] = 0;
             return;
         }
         self.expected = (self.foretold >> (7 - bit)) & 1;
-        self.slot = (self.view * CLASSES + class(self.longer)) * 8 + bit as usize;
+        self.slot = ((self.view * CLASSES + class(self.longer)) * 8 + bit as usize) % (VIEWS * CLASSES * 8);
         let h = ((self.foretold & 0xFF) << 8 | (cx.last4 & 0xFF)).wrapping_mul(0x9E37_79B1) >> (32 - SIDE_BITS + 3);
-        self.side_slot = ((h << 3) | bit) as usize;
-        let first = cx.scale.stretch(self.sure[self.slot] as u32 >> 4);
-        let second = cx.scale.stretch(self.side[self.side_slot] as u32 >> 4);
-        if self.expected == 1 {
-            out[0] = first;
-            out[1] = second;
-        } else {
-            out[0] = -first;
-            out[1] = -second;
-        }
+        self.side_slot = ((h << 3) | bit) as usize % (1 << SIDE_BITS);
+        let first = cx.scale.stretch((self.sure[self.slot] ^ START) as u32 >> 4);
+        let second = cx.scale.stretch((self.side[self.side_slot] ^ START) as u32 >> 4);
+        let m = self.expected as i32 - 1;
+        out[1] = (second ^ m) - m;
+        out[0] = (first ^ m) - m;
     }
 
     pub fn update(&mut self, _cx: &Context, bit: u32) {
@@ -189,9 +195,9 @@ impl Model {
             return;
         }
         let came = bit == self.expected;
-        for count in [&mut self.sure[self.slot], &mut self.side[self.side_slot]] {
-            let p = *count as u32;
-            *count = if came { p + ((65535 - p) >> RATE) } else { p - (p >> RATE) } as u16;
+        for count in [&mut self.sure[self.slot % (VIEWS * CLASSES * 8)], &mut self.side[self.side_slot % (1 << SIDE_BITS)]] {
+            let p = (*count ^ START) as u32;
+            *count = if came { p + ((65535 - p) >> RATE) } else { p - (p >> RATE) } as u16 ^ START;
         }
     }
 }
