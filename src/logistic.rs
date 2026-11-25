@@ -3,7 +3,8 @@
 //! confident model counts for more than a hesitant one, and squashed once, for the coder.
 //!
 //! Twelve bits are too few where the prediction is nearly sure (the last step before certainty is 1 in 4096,
-//! and the steps before it are as coarse): `squash_fine` gives the same probability out of 65536, for the coder.
+//! and the steps before it are as coarse): `squash_fine` gives the same probability out of 65536, for the coder,
+//! and `stretch` is read against it, so that each probability goes to its nearest step there too.
 //!
 //! Both are tables, filled when the program starts, with the four operations alone (the program has no
 //! mathematical library): the same tables on every machine.
@@ -28,17 +29,19 @@ impl Scale {
             let p = (65536.0 / (1.0 + exp(-(d as f64) / 256.0)) + 0.5) as u32;
             fine.push(p.clamp(1, 65535) as u16);
         }
-        // stretch(p): the first step whose squash reaches p.
+        // stretch(p): the step whose sixteen-bit squash is nearest p, read out of 65536. Near 0 and 1 the
+        // twelve-bit squash is flat over many steps, and its first step that reaches p is off by up to half a
+        // twelve-bit unit, the most where the prediction is nearly sure; the fine squash tells those steps apart.
         let mut stretch = Vec::with_capacity(4096);
         let mut d = 0usize;
         for p in 0..4096u32 {
-            while d < 4095 && (squash[d] as u32) < p {
+            let want = p << 4;
+            while d < 4095 && (fine[d] as u32) < want {
                 d += 1;
             }
-            stretch.push((d as i32 - 2048) as i16);
+            let near = if d > 0 && want - (fine[d - 1] as u32) < (fine[d] as u32).saturating_sub(want) { d - 1 } else { d };
+            stretch.push((near as i32 - 2048) as i16);
         }
-        // A count at the top of its range is as sure as one at the bottom: the far ends are a pair.
-        stretch[4095] = 2047;
         Scale { squash, fine, stretch }
     }
 
