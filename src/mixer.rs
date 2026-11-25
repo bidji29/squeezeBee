@@ -9,17 +9,26 @@
 //! error; the mixer's answer is their average.
 //!
 //! It works for any number of inputs: every weight starts at 1 / inputs, the plain average.
+//!
+//! The fourth set is chosen by what the match model says (how sure its learnt prediction is, in four classes,
+//! the first when it has no match, and which bit it foretells), by the kind of each of the last two bytes (its
+//! three high bits), and by the bits of this byte known so far. Where a sure match holds, the other models count
+//! for little; where there is none, they are all there is.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::context::Context;
+use crate::models::{order2, order3, order4, order6, pair};
 
 /// How many sets of weights are chosen at each bit, each by its own context.
-const SETS: usize = 3;
+const SETS: usize = 4;
 
 /// How many contexts each chooser tells apart.
-const SIZES: [usize; SETS] = [256 * 256; SETS];
+const SIZES: [usize; SETS] = [256 * 256, 256 * 256, 256 * 256, 512 * 256];
+
+/// Where the match model's first prediction is among the inputs: the models come in the order of their names.
+const REPEAT: usize = order2::OUTPUTS + order3::OUTPUTS + order4::OUTPUTS + order6::OUTPUTS + pair::OUTPUTS;
 
 /// A weight of 1 is 2^16.
 const ONE: i32 = 1 << 16;
@@ -73,27 +82,28 @@ impl Mixer {
         }
     }
 
-    /// The context each set of weights is chosen by: one of the last three whole bytes, and the bits of the
-    /// current byte known so far (which also give the bit's place).
-    fn choose(cx: &Context) -> [usize; SETS] {
+    /// The context each set of weights is chosen by: one of the last three whole bytes, or the match model's
+    /// word with the kinds of the last two, and the bits of the current byte known so far (which also give the
+    /// bit's place).
+    fn choose(cx: &Context, inputs: &[i32]) -> [usize; SETS] {
         let partial = cx.partial as usize;
         let byte = |back: u32| ((cx.last4 >> (8 * back)) & 0xFF) as usize;
-        [(byte(2) << 8) | partial, (byte(0) << 8) | partial, (byte(1) << 8) | partial]
+        let said = if REPEAT < inputs.len() { inputs[REPEAT] } else { 0 };
+        let sure = ((said.unsigned_abs() as usize + 511) >> 9).min(3) | if said > 0 { 4 } else { 0 };
+        let kinds = (byte(1) >> 5) << 3 | (byte(0) >> 5);
+        [(byte(2) << 8) | partial, (byte(0) << 8) | partial, (byte(1) << 8) | partial, (sure << 14) | (kinds << 8) | partial]
     }
 
     /// One stretched prediction from the models' stretched predictions.
     pub fn mix(&mut self, cx: &Context, inputs: &[i32]) -> i32 {
         let n = self.inputs;
         self.seen.copy_from_slice(&inputs[..n]);
-        let contexts = Self::choose(cx);
+        let contexts = Self::choose(cx, inputs);
         let mut sum = 0;
         for set in 0..SETS {
             let at = self.bases[set] + contexts[set] * n;
             self.chosen[set] = at;
-            let mut dot = 0i64;
-            for (w, x) in self.weights[at..at + n].iter().zip(self.seen.iter()) {
-                dot += *w as i64 * *x as i64;
-            }
+            let dot = dot(&self.weights[at..at + n], &self.seen);
             let said = ((dot >> 16) as i32).clamp(-2047, 2047);
             self.said[set] = said;
             sum += said;
@@ -113,9 +123,25 @@ impl Mixer {
                 self.counts[slot] = count + 1;
             }
             let speed = (FAST / (count as i64 + 1)).max(LEAST);
-            for (w, x) in self.weights[at..at + n].iter_mut().zip(self.seen.iter()) {
-                *w += ((*x as i64 * error as i64 * speed) >> (RATE + 4)) as i32;
-            }
+            train(&mut self.weights[at..at + n], &self.seen, error as i64 * speed);
         }
+    }
+}
+
+/// The weighted sum of the inputs.
+#[inline(never)]
+fn dot(weights: &[i32], inputs: &[i32]) -> i64 {
+    let mut dot = 0i64;
+    for (w, x) in weights.iter().zip(inputs.iter()) {
+        dot += *w as i64 * *x as i64;
+    }
+    dot
+}
+
+/// Each weight moves by its input times `step` (the error times the speed).
+#[inline(never)]
+fn train(weights: &mut [i32], inputs: &[i32], step: i64) {
+    for (w, x) in weights.iter_mut().zip(inputs.iter()) {
+        *w += ((*x as i64 * step) >> (RATE + 4)) as i32;
     }
 }
