@@ -18,6 +18,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::order4::{moved, rates};
 use crate::context::Context;
 
 pub const OUTPUTS: usize = 2;
@@ -31,7 +32,6 @@ const LIMIT: u32 = 60;
 const SEEN_BITS: u32 = 6;
 const SEEN_MASK: u32 = (1 << SEEN_BITS) - 1;
 const SLOW_BITS: u32 = 16;
-const SLOW_MASK: u32 = (1 << SLOW_BITS) - 1;
 const FAST_SHIFT: u32 = SEEN_BITS + SLOW_BITS;
 const FAST_BITS: u32 = 32 - FAST_SHIFT;
 
@@ -53,11 +53,7 @@ pub struct Model {
 
 impl Model {
     pub fn new() -> Self {
-        let mut rates = Vec::with_capacity(LIMIT as usize + 1);
-        for seen in 0..=LIMIT {
-            rates.push(131072 / (2 * seen + 3));
-        }
-        Model { slots: vec![EMPTY; 1 << BITS], rates, slot: 0 }
+        Model { slots: vec![EMPTY; 1 << BITS], rates: rates(LIMIT), slot: 0 }
     }
 
     /// The context has the word's hash: `history` is not read.
@@ -75,13 +71,8 @@ impl Model {
     pub fn update(&mut self, _cx: &Context, bit: u32) {
         let word = self.slots[self.slot];
         let fast = word >> FAST_SHIFT;
-        let slow = ((word >> SEEN_BITS) & SLOW_MASK) as i32;
-        let seen = word & SEEN_MASK;
         let fast = if bit == 1 { fast + (((1 << FAST_BITS) - fast) >> FAST) } else { fast - (fast >> FAST) };
-        // The slow count goes towards 0 or towards the top of its bits.
-        let target = (bit << SLOW_BITS) as i32 - bit as i32;
-        let slow = slow + (((target - slow) as i64 * self.rates[seen as usize] as i64) >> 16) as i32;
-        let seen = if seen < LIMIT { seen + 1 } else { seen };
-        self.slots[self.slot] = (fast << FAST_SHIFT) | ((slow as u32) << SEEN_BITS) | seen;
+        // The slow count and the counter move as every model's do.
+        self.slots[self.slot] = (fast << FAST_SHIFT) | moved(word, bit, &self.rates, SLOW_BITS, SEEN_BITS, LIMIT);
     }
 }

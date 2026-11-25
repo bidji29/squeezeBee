@@ -11,45 +11,25 @@
 //!
 //! Two predictions, as order 4's: the count's, stretched, and the same scaled by how much the count has seen.
 
-use alloc::vec;
-use alloc::vec::Vec;
-
+use super::order4::Checked;
 use crate::context::Context;
 
 pub const OUTPUTS: usize = 2;
-
-/// The counter stops here: from then on a count moves 1 / (LIMIT + 1.5) of the way.
-const LIMIT: u32 = 30;
 
 /// The table holds 2^BITS slots: few, so that a context comes back to its slot only while it is recent (measured:
 /// smaller tables did better here, down to this size).
 const BITS: u32 = 15;
 
-const CHECK_BITS: u32 = 8;
-const SEEN_BITS: u32 = 8;
-const SEEN_MASK: u32 = (1 << SEEN_BITS) - 1;
-
-/// A slot nobody has taken: a check of 0, a count at one half, nothing seen.
-const EMPTY: u32 = 1 << (SEEN_BITS + 15);
-
+/// The slots, their counts and their checks are order 4's (`Checked`), with LIMIT 30.
 pub struct Model {
-    slots: Vec<u32>,
-    /// 131072 / (2 seen + 3), for each value of the counter.
-    rates: Vec<u32>,
-    /// The hash of the six bytes before the byte being coded.
+    table: Checked,
+    /// What the whole bytes say of the context, worked out at a byte's start.
     base: u32,
-    slot: usize,
-    /// The check of the context being coded, already in its place at the top of a word.
-    check: u32,
 }
 
 impl Model {
     pub fn new() -> Self {
-        let mut rates = Vec::with_capacity(LIMIT as usize + 1);
-        for seen in 0..=LIMIT {
-            rates.push(131072 / (2 * seen + 3));
-        }
-        Model { slots: vec![EMPTY; 1 << BITS], rates, base: 0, slot: 0, check: 0 }
+        Model { table: Checked::new(BITS), base: 0 }
     }
 
     /// The context has the last eight bytes: `history` is not read.
@@ -59,34 +39,10 @@ impl Model {
             let h = six.wrapping_mul(0x9E37_79B9_7F4A_7C15);
             self.base = (h >> 32) as u32;
         }
-        let mut h = self.base.wrapping_add(cx.partial.wrapping_mul(0x632B_E5AB));
-        h ^= h >> 15;
-        h = h.wrapping_mul(0x2F0B_4A8D);
-        self.slot = (h >> (32 - BITS)) as usize;
-        h ^= h >> 13;
-        self.check = h << (32 - CHECK_BITS);
-        let word = self.slots[self.slot];
-        if (word ^ self.check) >> (32 - CHECK_BITS) != 0 {
-            out[0] = 0;
-            out[1] = 0;
-            return;
-        }
-        let seen = (word & SEEN_MASK) as i32;
-        let said = cx.scale.stretch((word >> (SEEN_BITS + 4)) & 0xFFF);
-        out[0] = said;
-        out[1] = said * seen / LIMIT as i32;
+        self.table.predict(self.base, cx, out);
     }
 
     pub fn update(&mut self, _cx: &Context, bit: u32) {
-        let mut word = self.slots[self.slot];
-        if (word ^ self.check) >> (32 - CHECK_BITS) != 0 {
-            word = EMPTY;
-        }
-        let seen = word & SEEN_MASK;
-        let p = ((word >> SEEN_BITS) & 0xFFFF) as i32;
-        let target = (bit << 16) as i32 - bit as i32;
-        let moved = p + (((target - p) as i64 * self.rates[seen as usize] as i64) >> 16) as i32;
-        let seen = if seen < LIMIT { seen + 1 } else { seen };
-        self.slots[self.slot] = self.check | ((moved as u32) << SEEN_BITS) | seen;
+        self.table.update(bit);
     }
 }

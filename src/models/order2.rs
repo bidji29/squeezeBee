@@ -14,6 +14,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::order4::{moved, rates};
 use crate::context::Context;
 
 pub const OUTPUTS: usize = 1;
@@ -34,11 +35,7 @@ pub struct Model {
 
 impl Model {
     pub fn new() -> Self {
-        let mut rates = Vec::with_capacity(LIMIT as usize + 1);
-        for seen in 0..=LIMIT {
-            rates.push(131072 / (2 * seen + 3));
-        }
-        Model { counts: vec![1 << 31; 1 << 24], rates, slot: 0 }
+        Model { counts: vec![1 << 31; 1 << 24], rates: rates(LIMIT), slot: 0 }
     }
 
     /// `history` holds the whole bytes coded so far (this model looks at the last two, which the context has).
@@ -50,13 +47,6 @@ impl Model {
     }
 
     pub fn update(&mut self, _cx: &Context, bit: u32) {
-        let word = self.counts[self.slot];
-        let seen = word & SEEN_MASK;
-        let p = (word >> SEEN_BITS) as i32;
-        // The count goes towards 0 or towards the top of its 22 bits.
-        let target = (bit << 22) as i32 - bit as i32;
-        let moved = p + (((target - p) as i64 * self.rates[seen as usize] as i64) >> 16) as i32;
-        let seen = if seen < LIMIT { seen + 1 } else { seen };
-        self.counts[self.slot] = ((moved as u32) << SEEN_BITS) | seen;
+        self.counts[self.slot] = moved(self.counts[self.slot], bit, &self.rates, 22, SEEN_BITS, LIMIT);
     }
 }

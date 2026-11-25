@@ -30,30 +30,50 @@ const SEEN_MASK: u32 = (1 << SEEN_BITS) - 1;
 /// A slot nobody has taken: a check of 0, a count at one half, nothing seen.
 const EMPTY: u32 = 1 << (SEEN_BITS + 15);
 
-pub struct Model {
+/// 131072 / (2 seen + 3), for each value of a counter that stops at `limit`: every model's counts move
+/// 1 / (seen + 1.5) of the way, and each takes its table of rates from here.
+#[inline(never)]
+pub fn rates(limit: u32) -> Vec<u32> {
+    (0..=limit).map(|seen| 131072 / (2 * seen + 3)).collect()
+}
+
+/// A count of `top` bits above a counter of `seen_bits` bits, in one word, moved towards `bit` by the rate its
+/// counter gives, the counter then raised until it reaches `limit`. Every model's slow counts move this way.
+#[inline(never)]
+pub fn moved(word: u32, bit: u32, rates: &[u32], top: u32, seen_bits: u32, limit: u32) -> u32 {
+    let seen = word & ((1 << seen_bits) - 1);
+    let p = ((word >> seen_bits) & ((1 << top) - 1)) as i32;
+    // The count goes towards 0 or towards the top of its bits.
+    let target = (bit << top) as i32 - bit as i32;
+    let moved = p + (((target - p) as i64 * rates[seen as usize] as i64) >> 16) as i32;
+    let seen = if seen < limit { seen + 1 } else { seen };
+    ((moved as u32) << seen_bits) | seen
+}
+
+/// The table of slots with a check, which order 4, order 6, the pair and the triple models share: each gives the
+/// hash of its whole bytes, `base`, and the number of its slots, and the rest of the work is this one.
+pub struct Checked {
     slots: Vec<u32>,
-    /// 131072 / (2 seen + 3), for each value of the counter.
     rates: Vec<u32>,
+    /// 32 - log2 of the number of slots.
+    shift: u32,
     slot: usize,
     /// The check of the context being coded, already in its place at the top of a word.
     check: u32,
 }
 
-impl Model {
-    pub fn new() -> Self {
-        let mut rates = Vec::with_capacity(LIMIT as usize + 1);
-        for seen in 0..=LIMIT {
-            rates.push(131072 / (2 * seen + 3));
-        }
-        Model { slots: vec![EMPTY; 1 << BITS], rates, slot: 0, check: 0 }
+impl Checked {
+    pub fn new(bits: u32) -> Self {
+        Checked { slots: vec![EMPTY; 1 << bits], rates: rates(LIMIT), shift: 32 - bits, slot: 0, check: 0 }
     }
 
-    /// The context has the last four bytes: `history` is not read.
-    pub fn predict(&mut self, cx: &Context, _history: &[u8], out: &mut [i32]) {
-        let mut h = cx.last4.wrapping_mul(0x9E37_79B1).wrapping_add(cx.partial.wrapping_mul(0x632B_E5AB));
+    /// The bits of this byte known so far are mixed into `base`, which chooses the slot and the check.
+    #[inline(never)]
+    pub fn predict(&mut self, base: u32, cx: &Context, out: &mut [i32]) {
+        let mut h = base.wrapping_add(cx.partial.wrapping_mul(0x632B_E5AB));
         h ^= h >> 15;
         h = h.wrapping_mul(0x2F0B_4A8D);
-        self.slot = (h >> (32 - BITS)) as usize;
+        self.slot = (h >> self.shift) as usize;
         h ^= h >> 13;
         self.check = h << (32 - CHECK_BITS);
         let word = self.slots[self.slot];
@@ -68,16 +88,31 @@ impl Model {
         out[1] = said * seen / LIMIT as i32;
     }
 
-    pub fn update(&mut self, _cx: &Context, bit: u32) {
+    #[inline(never)]
+    pub fn update(&mut self, bit: u32) {
         let mut word = self.slots[self.slot];
         if (word ^ self.check) >> (32 - CHECK_BITS) != 0 {
             word = EMPTY;
         }
-        let seen = word & SEEN_MASK;
-        let p = ((word >> SEEN_BITS) & 0xFFFF) as i32;
-        let target = (bit << 16) as i32 - bit as i32;
-        let moved = p + (((target - p) as i64 * self.rates[seen as usize] as i64) >> 16) as i32;
-        let seen = if seen < LIMIT { seen + 1 } else { seen };
-        self.slots[self.slot] = self.check | ((moved as u32) << SEEN_BITS) | seen;
+        self.slots[self.slot] = self.check | moved(word, bit, &self.rates, 16, SEEN_BITS, LIMIT);
+    }
+}
+
+pub struct Model {
+    table: Checked,
+}
+
+impl Model {
+    pub fn new() -> Self {
+        Model { table: Checked::new(BITS) }
+    }
+
+    /// The context has the last four bytes: `history` is not read.
+    pub fn predict(&mut self, cx: &Context, _history: &[u8], out: &mut [i32]) {
+        self.table.predict(cx.last4.wrapping_mul(0x9E37_79B1), cx, out);
+    }
+
+    pub fn update(&mut self, _cx: &Context, bit: u32) {
+        self.table.update(bit);
     }
 }

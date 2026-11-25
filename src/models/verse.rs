@@ -21,6 +21,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::order4::{moved, rates};
 use crate::context::Context;
 
 pub const OUTPUTS: usize = 2;
@@ -52,11 +53,7 @@ pub struct Model {
 
 impl Model {
     pub fn new() -> Self {
-        let mut rates = Vec::with_capacity(LIMIT as usize + 1);
-        for seen in 0..=LIMIT {
-            rates.push(131072 / (2 * seen + 3));
-        }
-        Model { counts: vec![1 << 31; OUTPUTS << BITS], rates, bases: [0; OUTPUTS], slots: [0; OUTPUTS] }
+        Model { counts: vec![1 << 31; OUTPUTS << BITS], rates: rates(LIMIT), bases: [0; OUTPUTS], slots: [0; OUTPUTS] }
     }
 
     /// The context has the column and the widths: `history` is not read.
@@ -79,13 +76,7 @@ impl Model {
 
     pub fn update(&mut self, _cx: &Context, bit: u32) {
         for &slot in self.slots.iter() {
-            let word = self.counts[slot];
-            let seen = word & SEEN_MASK;
-            let p = (word >> SEEN_BITS) as i32;
-            let target = (bit << 22) as i32 - bit as i32;
-            let moved = p + (((target - p) as i64 * self.rates[seen as usize] as i64) >> 16) as i32;
-            let seen = if seen < LIMIT { seen + 1 } else { seen };
-            self.counts[slot] = ((moved as u32) << SEEN_BITS) | seen;
+            self.counts[slot] = moved(self.counts[slot], bit, &self.rates, 22, SEEN_BITS, LIMIT);
         }
     }
 }
