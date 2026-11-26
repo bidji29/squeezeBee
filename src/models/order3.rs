@@ -30,8 +30,8 @@ const SLOW_BITS: u32 = 15;
 const FAST_SHIFT: u32 = SEEN_BITS + SLOW_BITS;
 const FAST_BITS: u32 = 32 - FAST_SHIFT;
 
-/// The table holds 2^BITS slots.
-const BITS: u32 = 22;
+/// The table holds 2^BITS slots, 64 MB (measured on the corpus: 2^22 made too many contexts share a slot).
+const BITS: u32 = 24;
 
 /// An odd multiplier near 2^32 divided by the golden ratio: it sends the 2^32 contexts each to its own
 /// 32-bit value, whose high bits are the slot.

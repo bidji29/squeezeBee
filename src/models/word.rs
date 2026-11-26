@@ -35,8 +35,9 @@ const SLOW_BITS: u32 = 16;
 const FAST_SHIFT: u32 = SEEN_BITS + SLOW_BITS;
 const FAST_BITS: u32 = 32 - FAST_SHIFT;
 
-/// The table holds 2^BITS slots.
-const BITS: u32 = 22;
+/// The table holds 2^BITS slots, 128 MB (measured on the corpus: words and their bits are many, and 2^22 and 2^24
+/// slots made them share more than this).
+const BITS: u32 = 25;
 
 /// An odd multiplier that sends each 32-bit context to its own 32-bit value, whose high bits are the slot.
 const SPREAD: u32 = 0x9E37_79B1;
