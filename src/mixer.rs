@@ -19,7 +19,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::context::Context;
-use crate::models::{order2, order3, order4, order6, pair};
+use crate::models::{order2, order3, order4, order5, order6, pair};
 
 /// How many sets of weights are chosen at each bit, each by its own context.
 const SETS: usize = 4;
@@ -28,7 +28,8 @@ const SETS: usize = 4;
 const SIZES: [usize; SETS] = [256 * 256, 256 * 256, 256 * 256, 512 * 256];
 
 /// Where the match model's first prediction is among the inputs: the models come in the order of their names.
-const REPEAT: usize = order2::OUTPUTS + order3::OUTPUTS + order4::OUTPUTS + order6::OUTPUTS + pair::OUTPUTS;
+const REPEAT: usize =
+    order2::OUTPUTS + order3::OUTPUTS + order4::OUTPUTS + order5::OUTPUTS + order6::OUTPUTS + pair::OUTPUTS;
 
 /// A weight of 1 is 2^16.
 const ONE: i32 = 1 << 16;
